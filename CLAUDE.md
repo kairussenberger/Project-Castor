@@ -6,6 +6,19 @@ them. The hardware boundary (`HardwareSink`) must always command through
 `safety/shaper.py` (limit-clamp + speed cap + accel cap + PD smoothing); never
 bypass it. All motion caps are per SECOND (real-dt integrated), never per frame.
 
+THE MOTOR BOUNDARY IS A DIFFERENT JOINT CONVENTION: this rig's motor zeros do
+NOT match this repo's model NOR i2rt's own convention (measured on metal: the
+official hang reads j2≈−177°, j6≈+312° in motor space). Every real
+command/state crosses the per-side affine map in `arms/joint_map.py`, MEASURED
+by `scripts/hw_bringup.py` and anchored at the official rest pose; `YamArm`
+refuses model-space commands without it, and `HardwareSink` refuses to start
+unless the arm MEASURES at rest through it (`hardware.engage_pose_tol`). The
+runtime drives the CAN chain DIRECTLY via `arms/yam_chain.py` — never through
+i2rt's `MotorChainRobot` (its qpos checks reject this rig's zeros at boot, and
+its gravity compensation assumes a TABLE mount while these arms hang SIDEWAYS;
+no model-based feedforward is ever sent). `hardware.sides` /
+`hardware.use_hands` must reflect what is physically wired.
+
 This repo no longer uses MuJoCo as the runtime simulator. The current target is a
 headless Python teleop process that:
 

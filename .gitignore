@@ -35,3 +35,5 @@ unity/TeleopRenderer/Builds/
 # incl. timestamped .bak-* forensics copies)
 config/operator_calib.json
 config/operator_calib.json.*
+# motor↔model joint calibration measured on THIS rig's motors (scripts/hw_bringup.py)
+config/hw_joint_map.json
