@@ -106,5 +106,6 @@ def make_source(rig: dict) -> VRSource:
         path = rig.get("vr", {}).get("replay_path")
         if not path:
             raise ValueError("vr.transport='replay' requires vr.replay_path in the rig config")
-        return ReplaySource(path, loop=rig["vr"].get("replay_loop", False))
+        return ReplaySource(path, loop=rig["vr"].get("replay_loop", False),
+                            speed=float(rig["vr"].get("replay_speed", 1.0)))
     raise ValueError(f"unknown vr.transport: {transport!r}")
