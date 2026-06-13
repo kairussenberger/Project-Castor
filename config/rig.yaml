@@ -182,6 +182,38 @@ safety:
   target_jump_speed: 3.0
   target_ang_speed_max: 2.5
   target_ang_accel_max: 25.0  # rad/s² — ramps to full turn rate in ~0.1 s
+  # RUNTIME hardware safety monitor (safety/runtime_guard.py @ HardwareSink): runs
+  # EVERY tick during a real session, on top of the 13 existing failsafes. Any trip
+  # releases torque on all arms and aborts the run. Tuned conservatively for the
+  # bring-up speeds; raise deliberately as you raise rate_limit / max_vel_scale.
+  runtime:
+    enabled: true
+    # ABSOLUTE per-joint speed ceiling (rad/s). hardware.rate_limit (and --rate-limit
+    # / jog --max-deg-s) are clamped DOWN to this — the arm can NEVER move faster than
+    # this no matter what any config, CLI flag, or dashboard control asks. 1.5 rad/s
+    # ≈ 86°/s; the bring-up rate_limit (1.2) already sits under it.
+    hard_max_joint_speed: 1.5
+    # TRACKING trip: commanded−measured gap (rad, shortest arc) that means a joint
+    # stopped following — snag, stall, collision, motor fault. PER-JOINT, because the
+    # gains differ hugely (kp [80,80,80,40,10,10]): MEASURED on metal 2026-06-13 the
+    # weak wrist-roll j6 lags ~29° at 0.2x and 83° at 1x DURING A NORMAL ROLL, while
+    # the strong shoulder (j1–j3) tracks to a few degrees. So: tight on j1–j3 (a real
+    # collision there opens a gap fast), generous on j4, effectively off on the weak
+    # j5/j6 (they physically cannot track a fast roll; only a ~180° sign-flip trips).
+    #                     j1   j2   j3   j4   j5   j6
+    max_tracking_error: [0.6, 0.6, 0.6, 1.4, 3.0, 3.0]   # rad  (34/34/34/80/172/172°)
+    tracking_grace_s: 1.0       # ignore the gap for this long after start (engage glide)
+    tracking_trip_s: 0.5        # gap must persist this long to trip (debounce)
+    # THERMAL / OVERCURRENT trips, read from the motors each tick (yam_chain.read).
+    max_motor_temp_c: 75.0      # MOSFET °C ceiling (thermal was a known-unknown)
+    # |effort| ceiling. MEASURED on metal 2026-06-13: j1 (shoulder) draws ~8.0 just
+    # HOLDING the arm against gravity (sideways mount), so the old 8.0 tripped on
+    # every engage. 25.0 sits ~3x above the gravity-hold so only a genuine stall /
+    # hard collision trips; the motor's own current limit is the hardware backstop.
+    max_motor_current: 25.0
+    # LOOP-STALL: wall-clock since the previous tick over this ⇒ the loop hung.
+    loop_stall_s: 0.5
+    warn_fraction: 0.8          # log a warning at this fraction of any limit
   # Mid-session ANCHOR-JUMP guard (safety/anchor_guard.py): a recenter, app
   # restart, or headset sleep moves the ORBIT stream anchors and silently
   # invalidates the applied calibration — the guard watches the body-relative
@@ -229,11 +261,18 @@ hardware:
   # ORCA hands: RealHand MOVES the hand to neutral at connect — keep false until
   # the hands are mounted, tensioned, and on their serial buses.
   use_hands: false
-  # Rest-pose engage gate (rad, per joint): a session refuses to start unless each
+  # Rest-pose engage gate, PER JOINT (rad): a session refuses to start unless each
   # wired arm MEASURES at the official resting pose (docs/RESTING_POSE.md) through
-  # its calibrated joint map. Catches wrong-arm-on-bus (j6 differs by π), ±2π boot
-  # wraps, zero drift, and not-at-rest starts — before any tracking torque.
-  engage_pose_tol: 0.15
+  # its calibrated joint map. The limp WRIST (j5/j6) rolls freely and settles 40–60°
+  # off every torque release, while the gravity-loaded shoulder (j1–j3) always hangs
+  # at the same place — so a single tolerance is wrong: tight enough for the shoulder
+  # rejects every normal wrist drift (which then drove operators to RE-ANCHOR a
+  # cocked pose and corrupt the map → the arm lifted). Per-joint fixes it: tight on
+  # j1–j4 (catches a real not-at-rest / wrong-arm start), loose on the freely-drifting
+  # j5/j6 (still catches a π wrong-arm flip — 180° ≫ 69°). No re-anchoring needed for
+  # normal drift; the clean map just works.
+  #                  j1    j2    j3    j4    j5    j6
+  engage_pose_tol: [0.15, 0.15, 0.15, 0.20, 1.20, 1.20]   # rad (8.6/8.6/8.6/11/69/69°)
   # Per-machine motor↔model joint calibration written by scripts/hw_bringup.py
   # (signs measured on metal; offsets anchored at the resting pose). Gitignored.
   joint_map_file: config/hw_joint_map.json

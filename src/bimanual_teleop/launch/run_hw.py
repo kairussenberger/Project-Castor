@@ -21,9 +21,12 @@ import argparse
 import sys
 import time
 
+import numpy as np
+
 from ..config import load_rig
 from ..engine import TeleopEngine
 from ..safety.clutch import GestureClutch, RecordedClutch
+from ..safety.runtime_guard import GuardTrip, effective_rate_limit
 from ..safety.supervisor import Supervisor
 from ..vr.ingest import make_source
 from ..vr.replay import SessionRecorder
@@ -57,9 +60,11 @@ def main() -> int:
         hw["sides"] = [s.strip() for s in args.sides.split(",") if s.strip()]
     if args.no_hands:
         hw["use_hands"] = False
+    _ept = hw.get('engage_pose_tol', 0.15)
+    _ept_str = (f"±{float(_ept):.2f} rad" if np.ndim(_ept) == 0
+                else "±[" + ",".join(f"{float(x):.2f}" for x in _ept) + "] rad/joint")
     print(f"[hw] arms: {hw.get('sides', ['left', 'right'])}  hands: {hw.get('use_hands', True)}  "
-          f"(rig hardware.sides / --sides; rest-pose gate ±"
-          f"{float(hw.get('engage_pose_tol', 0.15)):.2f} rad)")
+          f"(rig hardware.sides / --sides; rest-pose gate {_ept_str})")
     rig["vr"]["transport"] = args.vr
     if args.vr == "replay":
         if not args.replay_path:
@@ -79,6 +84,12 @@ def main() -> int:
     if args.rate_limit:
         rig["hardware"]["rate_limit"] = float(args.rate_limit)
         print(f"[hw] shaper rate_limit overridden -> {args.rate_limit:.2f} rad/s")
+    eff_rate = effective_rate_limit(rig)
+    ceiling = rig.get("safety", {}).get("runtime", {}).get("hard_max_joint_speed")
+    if ceiling is not None and eff_rate < float(rig["hardware"].get("rate_limit", 1.2)) - 1e-9:
+        print(f"[hw] HARD SPEED CEILING {ceiling} rad/s -> shaper clamped to {eff_rate:.2f} rad/s")
+    print(f"[hw] runtime guard: {'ON' if rig.get('safety', {}).get('runtime', {}).get('enabled', True) else 'OFF'} "
+          f"(tracking/thermal/overcurrent/loop-stall — trip releases torque)")
     src = make_source(rig)
     clutch = RecordedClutch(src) if args.clutch == "recorded" else GestureClutch()
 
@@ -104,6 +115,15 @@ def main() -> int:
                 self.hw.set_hand(side, j)
                 try:
                     self.rd.set_hand(side, j)
+                except Exception:
+                    pass
+
+            def telemetry(self):
+                return self.hw.telemetry() if hasattr(self.hw, "telemetry") else None
+
+            def release_all_torque(self):
+                try:
+                    self.hw.release_all_torque()
                 except Exception:
                     pass
 
@@ -136,7 +156,8 @@ def main() -> int:
             engine.tick(frame, engaged, t)
             if render is not None:
                 try:
-                    render.publish(engine, frame, engaged, 1.0 / period, t)
+                    render.publish(engine, frame, engaged, 1.0 / period, t,
+                                   hw=sink.telemetry() if hasattr(sink, "telemetry") else None)
                 except Exception:
                     pass
             if push_calib:
@@ -146,6 +167,11 @@ def main() -> int:
                 time.sleep(dt)
     except KeyboardInterrupt:
         print("\nstopping — releasing torque")
+    except GuardTrip as trip:
+        print(f"\n*** RUNTIME SAFETY TRIP — torque released on all arms, run aborted ***\n"
+              f"    {trip}\n"
+              f"    Inspect the rig, then re-run. Re-check the rest pose if needed: "
+              f"hw_bringup --step rest")
     finally:
         supervisor.estop()
         src.stop()

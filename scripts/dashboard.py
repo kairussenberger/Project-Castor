@@ -260,6 +260,32 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>bimanual-teleo
  <code id=metalCmd class=mono style="flex:1;white-space:nowrap;overflow:auto"></code>
  <button id=btnCopyMetal class="btn ghost sm">copy</button>
 </div>
+<div class=ctrlbar style="border-top:1px solid #2a3340">
+ <span class=meta style="font-weight:700;color:#ff9d57;letter-spacing:.3px">HARDWARE</span>
+ <span class=meta style="color:#8d97a5">drives the REAL right arm &mdash; e-stop in hand</span>
+ <button id=btnReanchor class="btn ghost sm" title="re-anchor the rest pose at the arm's current limp hang so the engage gate passes (hw_bringup --step rest). Limp, no motion. Do this if a HW launch fails the REST-POSE GATE.">&#8635; RE-ANCHOR REST</button>
+ <select id=selHwClutch class=sel title="gesture: arms follow ONLY while you hold the pinch (deadman). always: follow whenever tracked.">
+  <option value=gesture selected>clutch: gesture</option>
+  <option value=always>clutch: always</option>
+ </select>
+ <button id=btnHwReplay class="btn play sm" title="drive the RIGHT ARM with the selected REPLAY tape at the speed-slider speed (--rate-limit 0.5). Rest-gate + runtime guard active.">&#9881; HW REPLAY (metal)</button>
+ <button id=btnHwTeleop class="btn play sm" title="LIVE Quest teleop on the RIGHT ARM (run_hw --vr orbit). Rest-gate + runtime guard active.">&#9881; HW TELEOP (metal)</button>
+ <button id=btnLog class="btn ghost sm" title="show the run_hw / engine log — why a launch died (guard trips, gate failures, errors)">&#128203; LOG</button>
+ <span style="flex:1"></span>
+ <button id=btnRelease class="btn kill" title="EMERGENCY: SIGINT every mover on this host so run_hw / jog release torque — the arm goes LIMP. NOT a substitute for the physical e-stop.">&#9211; RELEASE TORQUE</button>
+</div>
+<div id=logRow style="display:none;padding:8px 16px;background:#0b0e13;border-bottom:1px solid #232936">
+ <div id=logTrip style="color:#ff9a9a;font-weight:700;font-size:13px;margin-bottom:5px;display:none"></div>
+ <pre id=engLog style="margin:0;max-height:200px;overflow:auto;font-size:11px;line-height:1.35;color:#9fb2c8;white-space:pre-wrap"></pre>
+</div>
+<div id=hwTrip style="display:none;padding:12px 16px;background:#3a1414;border-bottom:2px solid #ff5252;align-items:center;gap:14px">
+ <span style="font-size:20px">&#9888;</span>
+ <div style="flex:1">
+  <div id=hwTripMsg style="font-weight:800;font-size:15px;color:#ff9a9a">RUNTIME SAFETY TRIP</div>
+  <div class=meta style="margin-top:3px;color:#e6b0b0">torque was released — inspect the rig, then re-launch (hw_bringup --step rest if the pose drifted).</div>
+ </div>
+ <button id=btnTripAck class="btn ghost sm">dismiss</button>
+</div>
 <div id=calBanner style="display:none;padding:12px 16px;background:#2b2410;border-bottom:2px solid #d4af37;align-items:center;gap:14px">
  <span style="font-size:20px">&#129337;</span>
  <div style="flex:1">
@@ -284,6 +310,7 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>bimanual-teleo
    <canvas id=cvO width=952 height=430></canvas></div>
  </div>
  <div>
+  <div class=panel id=cardSafety style="margin-bottom:14px;display:none"></div>
   <div class=panel id=cardR style="margin-bottom:14px"></div>
   <div class=panel id=cardL></div>
  </div>
@@ -505,6 +532,56 @@ let CAL_ACTIVE=false;
 let WSEMA={left:0,right:0};
 $('btnCalib').onclick=()=>control({action:CAL_ACTIVE?'calibrate_cancel':'calibrate'});
 $('btnCalClear').onclick=()=>control({action:'calibrate_clear'});
+let HWTRIP_ACK='';
+$('btnHwReplay').onclick=()=>{const f=$('selRec').value;
+ if(!f){alert('Pick a REPLAY tape in the row above first.');return;}
+ if(!confirm('Drive the REAL right arm with '+f+' at '+speed().toFixed(2)+'×?\\n\\nThe arm WILL move. Keep a hand on the e-stop. The rest-pose gate, runtime guard, and hard speed ceiling are active.'))return;
+ control({action:'start_hw_replay',file:f,speed:speed().toFixed(2)})};
+$('btnHwTeleop').onclick=()=>{
+ if(!confirm('Start LIVE Quest teleop on the REAL right arm?\\n\\nThe arm follows your hand once engaged ('+$('selHwClutch').value+' clutch). Keep a hand on the e-stop. Runtime guard + hard speed ceiling are active.'))return;
+ control({action:'start_hw_teleop',clutch:$('selHwClutch').value})};
+$('btnRelease').onclick=()=>{control({action:'release_torque'})};
+$('btnReanchor').onclick=()=>{const b=$('btnReanchor');b.textContent='re-anchoring…';b.disabled=true;
+ control({action:'reanchor_rest'}).then(()=>{b.textContent='↻ RE-ANCHOR REST';b.disabled=false})};
+let LOGOPEN=false;
+async function fetchLog(){
+ try{const r=await(await fetch('/enginelog')).json();
+  $('engLog').textContent=(r.lines||[]).join('\\n');
+  const t=$('logTrip');
+  if(r.trip){t.style.display='';t.textContent='⚠ '+r.trip}else t.style.display='none';
+  $('engLog').scrollTop=$('engLog').scrollHeight;
+  return r.trip||'';
+ }catch(e){return''}
+}
+$('btnLog').onclick=()=>{LOGOPEN=!LOGOPEN;$('logRow').style.display=LOGOPEN?'block':'none';if(LOGOPEN)fetchLog()};
+$('btnTripAck').onclick=()=>{const hw=LASTHW;HWTRIP_ACK=hw&&hw.trip?(hw.trip.kind+hw.trip.detail):'ack';$('hwTrip').style.display='none'};
+let LASTHW=null;
+function bar01(pct,col){return '<div class="bar" style="margin:3px 0 7px"><span class=tick style="left:'+Math.min(100,pct).toFixed(0)+'%;background:'+col+';width:4px"></span></div>'}
+function updSafety(st){
+ const hw=st&&st.status?st.status.hw:null; LASTHW=hw;
+ const cd=$('cardSafety'), tb=$('hwTrip');
+ if(!hw){cd.style.display='none';tb.style.display='none';return}
+ cd.style.display='';
+ const trip=hw.trip, lim=hw.limits||{}, wf=lim.warn_frac||0.8;
+ const tripKey=trip?(trip.kind+trip.detail):'';
+ if(trip&&tripKey!==HWTRIP_ACK){tb.style.display='flex';
+  $('hwTripMsg').textContent='⚠ RUNTIME SAFETY TRIP ['+trip.kind+'] — '+trip.detail}
+ else tb.style.display='none';
+ let h='<div class=ptitle>SAFETY <span>— runtime guard '+(hw.enabled?'<b style="color:#41d98d">ON</b>':'<b style="color:#ff8a8a">OFF</b>')
+  +(trip?' · <b style="color:#ff8a8a">TRIPPED: '+trip.kind+'</b>':'')+'</span></div>';
+ h+='<div class=kv><span>hard speed ceiling</span><b>'+(hw.hard_max_joint_speed!=null?hw.hard_max_joint_speed+' rad/s':'—')+'</b></div>';
+ h+='<div class=kv><span>shaper rate (clamped)</span><b>'+(hw.eff_rate!=null?hw.eff_rate+' rad/s':'—')+'</b></div>';
+ for(const side of(hw.sides||[])){const a=(hw.arms||{})[side];if(!a)continue;
+  h+='<div style="margin-top:9px;font-weight:700;color:#9fb2c8;font-size:12px">'+side.toUpperCase()+' arm</div>';
+  if(a.gap_max!=null){const p=100*a.gap_max/(lim.track||0.35);
+   h+='<div class=kv><span>tracking gap</span><b style="color:'+(p>100?'#ff8a8a':p>100*wf?'#e8b339':'#41d98d')+'">'+(a.gap_max*57.2958).toFixed(1)+'° (j'+a.gap_joint+')</b></div>'+bar01(p,p>100*wf?'#ff8a8a':'#41d98d')}
+  if(a.temp_max!=null){const p=100*a.temp_max/(lim.temp||75);
+   h+='<div class=kv><span>motor temp</span><b style="color:'+(p>100?'#ff8a8a':p>100*wf?'#e8b339':'#9fb2c8')+'">'+a.temp_max.toFixed(0)+'°C</b></div>'+bar01(p,p>100*wf?'#ff8a8a':'#e8b339')}
+  if(a.effort_max!=null){const p=100*a.effort_max/(lim.current||8);
+   h+='<div class=kv><span>motor effort</span><b style="color:'+(p>100*wf?'#ff8a8a':'#9fb2c8')+'">'+a.effort_max.toFixed(1)+'</b></div>'+bar01(p,p>80?'#ff8a8a':'#6f9fe8')}
+ }
+ cd.innerHTML=h;
+}
 function updCalib(st){
  const c=st&&st.status?st.status.calib:null, applied=st&&st.status?st.status.calib_applied:null;
  const locked=!!(st&&st.status&&st.status.follow_locked);
@@ -581,10 +658,16 @@ async function tick(){
     wc.textContent='WS CLAMP '+(WSEMA.left>0.5?'L':'')+(WSEMA.right>0.5?'R':'')+' — mapping off? recalibrate'}
    else wc.style.display='none';
    updCalib(s);
+   if(ctrlN%6===0)updSafety(s);          // telemetry panel: 8 Hz, not every frame
    drawHands(s);drawRobot(s,d.mesh_T,d.hand_mesh,d.hand_T);drawOverlay(s,d.mesh_T,d.hand_mesh,d.hand_T);
    $('cardL').innerHTML=card('left',s);$('cardR').innerHTML=card('right',s);
   }
-  if(++ctrlN%20===1){try{updCtrl(await(await fetch('/control?action=status')).json())}catch(e){}}
+  // status + engine-log polls are SLOW (pgrep/subprocess, file read) — fire them
+  // WITHOUT await so they never block the render loop (that was the stutter/freeze).
+  if(++ctrlN%20===1){
+   fetch('/control?action=status').then(r=>r.json()).then(updCtrl).catch(()=>{});
+   fetchLog().then(trip=>{ if(trip){const h=$('hint');h.textContent='✗ '+trip;h.style.color='#ff8a8a';} });
+  }
  }catch(e){chip('conn','bad','dashboard error')}
  requestAnimationFrame(()=>setTimeout(tick,50));
 }
@@ -698,6 +781,10 @@ class EngineManager:
         busy = []
         for p in cls.ENGINE_PORTS:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # SO_REUSEADDR so a lingering TIME_WAIT socket from a just-stopped engine
+            # does NOT read as "busy" (the engine binds with reuse too). Without this,
+            # every launch right after a stop failed with "ports [8102] still busy".
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 s.bind(("127.0.0.1", p))
             except OSError:
@@ -729,14 +816,14 @@ class EngineManager:
             busy = self._busy_ports()
         return busy
 
-    def _spawn(self, args, mode, record):
+    def _spawn(self, args, mode, record, module="bimanual_teleop.launch.run_teleop"):
         (REPO_ROOT / "out").mkdir(exist_ok=True)
         log_path = REPO_ROOT / "out" / "engine.log"
         log = open(log_path, "ab")
-        log.write(f"\n===== {time.strftime('%H:%M:%S')} dashboard spawn: {mode} =====\n".encode())
+        log.write(f"\n===== {time.strftime('%H:%M:%S')} dashboard spawn: {mode} ({module}) =====\n".encode())
         log.flush()
         scan_from = log_path.stat().st_size
-        self.proc = subprocess.Popen([_sys.executable, "-m", "bimanual_teleop.launch.run_teleop", *args],
+        self.proc = subprocess.Popen([_sys.executable, "-m", module, *args],
                                      cwd=REPO_ROOT, stdout=log, stderr=subprocess.STDOUT)
         log.close()
         self.mode, self.record, self.t0 = mode, record, time.time()
@@ -799,6 +886,71 @@ class EngineManager:
         if loop:
             label += " (loop)"
         return self._start(args, label, None)
+
+    # ---- HARDWARE launch (drives the REAL arm) -------------------------------- #
+    # run_hw binds the same render ports as the dashboard engine, so a hardware
+    # launch stops the render engine first, frees the ports, then takes over the
+    # stream — the dashboard then shows the live METAL state + the runtime-guard
+    # safety telemetry (status.hw). The rest-pose gate + runtime guard + hard speed
+    # ceiling all apply; STOP ALL / RELEASE TORQUE remain the kill switch.
+    def _start_hw(self, args, mode, record):
+        with self._lock:
+            self._stop_inner()                          # free 8101/8102 from the render engine
+            for pat, _ in self.KILL_TARGETS:            # and from any stray hw process
+                if self._matches(pat):
+                    subprocess.run(["pkill", "-INT", "-f", pat], capture_output=True)
+            deadline = time.time() + 10.0
+            busy = self._busy_ports()
+            while busy and time.time() < deadline:
+                time.sleep(0.4)
+                busy = self._busy_ports()
+            if busy:
+                self.last_msg = f"FAILED: render ports {busy} still busy — press STOP ALL, then retry"
+                return self.status()
+            self._spawn(args, mode, record, module="bimanual_teleop.launch.run_hw")
+            return self.status()
+
+    def start_hw_replay(self, file: str, speed: float = 0.3):
+        # --clutch recorded: replay the recording's OWN engagement decisions so the
+        # arm actually follows the tape. Without it run_hw defaults to gesture clutch
+        # and never engages on a replay → the arm just holds at rest (looks dead).
+        args = ["--vr", "replay", file, "--clutch", "recorded", "--rate-limit", "0.5"]
+        if speed != 1.0:
+            args += ["--speed", f"{speed:g}"]
+        return self._start_hw(args, f"HW-METAL REPLAY {Path(file).name} @{speed:g}x", None)
+
+    def start_hw_teleop(self, clutch: str = "gesture"):
+        clutch = clutch if clutch in ("always", "gesture") else "gesture"
+        rec = f"recordings/hw_{time.strftime('%m%d_%H%M%S')}.npz"
+        return self._start_hw(["--vr", "orbit", "--clutch", clutch, "--record", rec],
+                              f"HW-METAL TELEOP ({clutch})", rec)
+
+    def reanchor_rest(self):
+        """Re-anchor the motor↔model offsets at the arm's current limp hang
+        (scripts/hw_bringup.py --step rest) so the rest-pose engage gate passes —
+        the dashboard equivalent of the terminal step. Limp, settle-checked, no
+        motion. Frees the bus first; nothing else may hold can0 during this."""
+        with self._lock:
+            self._stop_inner()
+            for pat, _ in self.KILL_TARGETS:
+                if self._matches(pat):
+                    subprocess.run(["pkill", "-INT", "-f", pat], capture_output=True)
+            time.sleep(1.2)
+            try:
+                r = subprocess.run([_sys.executable, "scripts/hw_bringup.py", "--step", "rest"],
+                                   cwd=REPO_ROOT, input=b"\n", capture_output=True, timeout=40)
+                out = (r.stdout + r.stderr).decode(errors="ignore")
+                gate = [ln.strip() for ln in out.splitlines()
+                        if "through the SAVED" in ln or "re-anchored" in ln or "still matches" in ln]
+                ok = ("re-anchored" in out) or ("still matches" in out) or ("complete for this arm" in out)
+                tail = (" — " + gate[-1]) if gate else ""
+                self.last_msg = ("REST re-anchored ✓ gate will pass" if ok
+                                 else "REST re-anchor: check the arm is hanging free") + tail
+            except subprocess.TimeoutExpired:
+                self.last_msg = "REST re-anchor timed out — is the arm powered / bus free?"
+            except Exception as e:
+                self.last_msg = f"REST re-anchor failed: {e}"
+            return self.status()
 
     # STOP ALL targets: everything that can move metal or hold the CAN bus. The
     # dashboard's own render engine (run_teleop) is stopped gracefully first via
@@ -868,7 +1020,10 @@ class EngineManager:
             if self.proc is not None and not alive and self.mode is not None:
                 self.last_msg = f"{self.mode} exited"
                 self.mode, self.record, self.t0 = None, None, None
-        recs = sorted(glob.glob(str(REPO_ROOT / "recordings" / "*.npz")))
+        # Both the curated committed tapes (replay_library/) AND any session
+        # recordings/ — the dropdown was empty on a fresh clone (no recordings/ dir).
+        recs = sorted(glob.glob(str(REPO_ROOT / "replay_library" / "*.npz"))
+                      + glob.glob(str(REPO_ROOT / "recordings" / "*.npz")))
         return {"running": alive, "mode": self.mode, "record": self.record,
                 "uptime": round(time.time() - self.t0, 1) if (alive and self.t0) else None,
                 "msg": self.last_msg,
@@ -902,8 +1057,21 @@ class EngineManager:
             return self.start_replay(f, (query.get("loop") or ["0"])[0] == "1", sp)
         if action == "stop":
             return self.stop()
-        if action == "kill_all":
+        if action in ("kill_all", "release_torque"):    # both: SIGINT every mover → torque released
             return self.kill_all()
+        if action == "start_hw_replay":
+            f = (query.get("file") or [""])[0]
+            if not f or not (REPO_ROOT / f).exists():
+                return {"error": f"no such recording: {f}", **self.status()}
+            try:
+                sp = float((query.get("speed") or ["0.3"])[0])
+            except ValueError:
+                sp = 0.3
+            return self.start_hw_replay(f, sp)
+        if action == "start_hw_teleop":
+            return self.start_hw_teleop((query.get("clutch") or ["gesture"])[0])
+        if action == "reanchor_rest":
+            return self.reanchor_rest()
         if action in ("calibrate", "calibrate_cancel", "calibrate_clear"):
             return self.engine_cmd(action)
         return self.status()
@@ -971,6 +1139,26 @@ def make_server(feed: StateFeed, host: str, port: int, rig: dict | None = None,
             elif self.path.startswith("/control"):
                 q = parse_qs(urlparse(self.path).query)
                 out = manager.dispatch(q) if manager else {"error": "no manager"}
+                body = json.dumps(out).encode()
+                ctype = "application/json"
+            elif self.path.startswith("/enginelog"):
+                # Tail of the engine/run_hw log so the dashboard SHOWS why a launch
+                # died (guard trips, gate failures, tracebacks) instead of hiding it.
+                logp = REPO_ROOT / "out" / "engine.log"
+                txt = ""
+                try:
+                    with open(logp, "rb") as fh:
+                        fh.seek(0, 2)
+                        size = fh.tell()
+                        fh.seek(max(0, size - 6000))
+                        txt = fh.read().decode("utf-8", "replace")
+                except OSError:
+                    txt = "(no engine.log yet)"
+                lines = [ln for ln in txt.splitlines() if ln.strip()][-40:]
+                trip = next((ln for ln in reversed(lines)
+                             if "SAFETY TRIP" in ln or "GATE FAILED" in ln
+                             or "Error" in ln or "error" in ln or "Traceback" in ln), "")
+                out = {"lines": lines, "trip": trip.strip()}
                 body = json.dumps(out).encode()
                 ctype = "application/json"
             elif self.path.startswith("/recinfo") or self.path.startswith("/analyze"):

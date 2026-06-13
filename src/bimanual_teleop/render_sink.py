@@ -248,9 +248,14 @@ class RenderSink:
         self._hand[side] = dict(joints_deg)
 
     # ---- build / publish one render frame --------------------------------- #
-    def build_state(self, engine, frame, engaged: dict, hz: float, t: float) -> dict:
+    def build_state(self, engine, frame, engaged: dict, hz: float, t: float,
+                    hw: dict | None = None) -> dict:
         """Build + send the render.state message. Reads achieved/commanded EE frames
-        off the engine's per-arm controllers (FK already computed this tick)."""
+        off the engine's per-arm controllers (FK already computed this tick).
+
+        `hw` (optional): the HardwareSink runtime-guard telemetry snapshot — measured
+        vs commanded gap, motor temp/current, guard limits, and any trip. Added to
+        `status.hw` for the dashboard safety panel; an additive field Unity ignores."""
         arms = {}
         for s in SIDES:
             ac = engine.arm[s]
@@ -300,15 +305,20 @@ class RenderSink:
             # the dashboard banner and post-session forensics.
             "guard": (engine.guard.status()
                       if getattr(engine, "guard", None) is not None else None),
+            # Runtime HARDWARE safety telemetry (HardwareSink.telemetry): per-joint
+            # tracking gap, motor temp/current, guard limits, and any trip. None on
+            # the sim/render path. Additive — Unity's JsonUtility ignores it.
+            "hw": hw,
             "hz": float(hz),
         }
         hand_render = {s: ordered_hand_state(self._hand[s]) for s in SIDES}
         return topics.msg(stamp=float(t), arms=arms, hands=dict(self._hand),
                           hand_render=hand_render, op=op_state, status=status)
 
-    def publish(self, engine, frame, engaged: dict, hz: float, t: float) -> None:
+    def publish(self, engine, frame, engaged: dict, hz: float, t: float,
+                hw: dict | None = None) -> None:
         """Build and send the latest Unity/Python render state."""
-        msg = self.build_state(engine, frame, engaged, hz, t)
+        msg = self.build_state(engine, frame, engaged, hz, t, hw=hw)
         if self.pub is not None:
             self.pub.send(topics.RENDER_STATE, msg)
         if self.json is not None:

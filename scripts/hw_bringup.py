@@ -202,8 +202,15 @@ def _boot_verdict_table(q_rest: np.ndarray) -> None:
     through i2rt's MotorChainRobot, so its boot qpos check no longer applies —
     but i2rt's OWN tools (examples, motor_chain_robot __main__) still reject
     poses outside these rows, which is expected on this rig."""
-    from i2rt.robot_models import ARM_YAM_XML_PATH
-    from i2rt.robots.get_robot import _load_joint_limits_from_xml
+    try:
+        from i2rt.robot_models import ARM_YAM_XML_PATH
+        from i2rt.robots.get_robot import _load_joint_limits_from_xml
+    except ImportError as e:
+        # This table is purely informational; i2rt.robots pulls in the sim stack
+        # (mujoco/dm_env) the hardware path does not need. Skip if it is absent.
+        print(f"\n(skipping i2rt-convention table — {e.name} not installed; "
+              "informational only, the runtime drives the chain directly)")
+        return
     lim = _load_joint_limits_from_xml(ARM_YAM_XML_PATH)[:6]
     print("\nmotor zeros vs i2rt's own convention (informational — the runtime does not\n"
           "use i2rt's MotorChainRobot; only i2rt's own tools enforce these rows):")
@@ -236,12 +243,30 @@ def step_rest(channel: str, rig: dict, side: str, map_file: Path) -> np.ndarray 
         existing = load_joint_map(map_file, side)
         if existing is not None:
             gate = rest_pose_gate(existing.to_model(q_rest), neutral,
-                                  float(rig["hardware"].get("engage_pose_tol", 0.15)))
+                                  rig["hardware"].get("engage_pose_tol", 0.15))
             print(f"through the SAVED map: {gate.describe()}")
             if gate.ok:
                 print("✓ saved calibration still matches — nothing to do")
                 return q_rest
-            print("⚠ saved map disagrees (±2π wrap or drift). Re-anchoring offsets at this rest.")
+            # SAFETY: re-anchoring saves WHATEVER pose the arm is in as "rest". If
+            # ANY joint (not just the shoulder — the cocked WRIST is what corrupted
+            # the map before) is far from the saved rest, the arm is NOT hanging at
+            # rest and re-anchoring would bake a wrong rest in. The engage gate
+            # tolerates normal limp-wrist drift on its own (per-joint engage_pose_tol),
+            # so re-anchoring is rarely needed — refuse a wild pose. (Shortest-arc, so
+            # a harmless ±2π wrap does not count.)
+            expected_motor = existing.to_motor(neutral)
+            drift = np.abs(((q_rest - expected_motor) + np.pi) % (2 * np.pi) - np.pi)
+            if float(np.max(drift)) > np.radians(35.0):
+                bad = int(np.argmax(drift))
+                print(f"✗ REFUSING to re-anchor: j{bad + 1} is "
+                      f"{np.degrees(float(drift[bad])):.0f}° off the saved rest — the arm is NOT at the "
+                      f"hanging rest pose (lifted / cocked wrist).\n"
+                      f"  The engage gate already tolerates normal wrist drift, so you likely don't need "
+                      f"this. Hang the arm straight down, palm inward, THEN re-run. "
+                      f"Re-anchoring a wrong pose corrupts the map (it's what made the arm lift).")
+                return None
+            print("⚠ saved map disagrees (wrist ±2π wrap / drift). Re-anchoring offsets at this rest.")
             jm = JointMap.anchored_at_rest(existing.signs, q_rest, neutral)
             save_joint_map(map_file, side, jm, channel=channel, q_motor_rest=q_rest)
             print(f"✓ offsets re-anchored → {map_file}")
@@ -340,7 +365,7 @@ def step_verify(channel: str, rig: dict, side: str, map_file: Path) -> bool:
         print(f"✗ no calibration for {side} in {map_file} — run --step signs first")
         return False
     neutral = np.asarray(rig["arms"][side]["neutral_q"], dtype=float)
-    tol = float(rig["hardware"].get("engage_pose_tol", 0.15))
+    tol = rig["hardware"].get("engage_pose_tol", 0.15)
     if not confirm("Arm at rest, dashboard open, e-stop in reach?"):
         return False
     sess = open_chain(channel)

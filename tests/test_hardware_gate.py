@@ -97,3 +97,40 @@ def test_missing_calibration_refuses_with_instructions(hw_rig, tmp_path):
     hw_rig["hardware"]["joint_map_file"] = str(tmp_path / "absent.json")
     with pytest.raises(RuntimeError, match="hw_bringup"):
         HardwareSink(hw_rig)
+
+
+def test_hard_speed_ceiling_applied_to_shaper(hw_rig):
+    """hardware.rate_limit above the ceiling is clamped DOWN at the shaper."""
+    hw_rig["hardware"]["rate_limit"] = 9.0
+    hw_rig["safety"] = {"runtime": {"hard_max_joint_speed": 1.5}}
+    sink = HardwareSink(hw_rig)
+    assert sink.shapers["right"].rate == 1.5
+
+
+def test_guard_trip_in_set_arm_releases_torque_and_raises(hw_rig):
+    """A runtime trip during a session must make ALL arms limp and propagate so the
+    run loop aborts — verified through the real set_arm path."""
+    from bimanual_teleop.safety.runtime_guard import GuardTrip
+
+    sink = HardwareSink(hw_rig)
+    arm = sink.arms["right"]
+
+    class _FakeChain:                       # telemetry the guard reads each tick
+        def read(self):
+            return (np.zeros(6), np.zeros(6), np.zeros(6), np.full(6, 40.0))
+
+    arm.chain = _FakeChain()
+    arm.release_torque = lambda: setattr(arm, "released", True)
+
+    class _Tripper:                         # forces a trip on the next check
+        enabled = True
+        tripped = None
+        last: dict = {}
+
+        def check(self, *a, **k):
+            raise GuardTrip("tracking", "forced for test")
+
+    sink.guard = _Tripper()
+    with pytest.raises(GuardTrip):
+        sink.set_arm("right", np.asarray(hw_rig["arms"]["right"]["neutral_q"], dtype=float))
+    assert getattr(arm, "released", False) is True

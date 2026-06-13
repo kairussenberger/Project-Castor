@@ -475,6 +475,7 @@
       "tripped": false,
       "trips": 0
     },
+    "hw": null,
     "hz": 100.0,
     "tracked": {
       "left": true,

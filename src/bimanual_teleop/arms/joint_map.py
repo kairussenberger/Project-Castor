@@ -73,11 +73,13 @@ class PoseGate:
 
     ok: bool
     deltas: np.ndarray              # measured_model − neutral_q, rad
-    tol: float
-    worst: int = field(init=False)  # joint index of the largest violation
+    tol: np.ndarray                 # per-joint tolerance, rad (a scalar broadcasts)
+    worst: int = field(init=False)  # joint index of the largest violation vs ITS tol
 
     def __post_init__(self):
-        self.worst = int(np.argmax(np.abs(self.deltas)))
+        self.tol = np.broadcast_to(np.asarray(self.tol, dtype=float),
+                                   self.deltas.shape).astype(float).copy()
+        self.worst = int(np.argmax(np.abs(self.deltas) / np.maximum(self.tol, 1e-9)))
 
     def describe(self) -> str:
         rows = ", ".join(
@@ -85,22 +87,30 @@ class PoseGate:
             for i, d in enumerate(self.deltas)
         )
         verdict = "within" if self.ok else "EXCEEDS"
-        return f"measured−rest [{rows}] {verdict} ±{np.degrees(self.tol):.1f}°"
+        if np.allclose(self.tol, self.tol.flat[0]):
+            tolstr = f"±{np.degrees(self.tol.flat[0]):.1f}°"
+        else:
+            tolstr = "±[" + " ".join(f"{np.degrees(t):.0f}" for t in self.tol) + "]°"
+        return f"measured−rest [{rows}] {verdict} {tolstr}"
 
 
-def rest_pose_gate(measured_model, neutral_q, tol_rad: float) -> PoseGate:
+def rest_pose_gate(measured_model, neutral_q, tol_rad) -> PoseGate:
     """May this arm start tracking model commands? Only if it is measurably AT
-    the official rest pose. Fail-closed on any non-finite input."""
+    the official rest pose. `tol_rad` may be a scalar or a PER-JOINT vector — the
+    freely-drifting limp WRIST (j5/j6) needs a loose tolerance while the
+    gravity-stable shoulder stays tight. Fail-closed on any non-finite input."""
+    tol = np.asarray(tol_rad, dtype=float)
+    tol = np.full(N_JOINTS, float(tol)) if tol.ndim == 0 else tol.reshape(-1)[:N_JOINTS]
     try:
         raw = _vec(measured_model, "measured") - _vec(neutral_q, "neutral_q")
     except ValueError:
-        return PoseGate(False, np.full(N_JOINTS, np.inf), float(tol_rad))
+        return PoseGate(False, np.full(N_JOINTS, np.inf), tol)
     # Shortest-arc comparison: the multi-turn wrap normalizer can land on either
     # 2pi branch when a joint rests near +-180 deg (j2 does), and that branch
     # choice is not a pose error. A true full-turn offset cannot survive the
     # fresh-read normalization at chain open, so modulo-2pi distance is exact.
     deltas = (raw + np.pi) % (2.0 * np.pi) - np.pi
-    return PoseGate(bool(np.all(np.abs(deltas) <= float(tol_rad))), deltas, float(tol_rad))
+    return PoseGate(bool(np.all(np.abs(deltas) <= tol)), deltas, tol)
 
 
 # --------------------------------------------------------------------------- #

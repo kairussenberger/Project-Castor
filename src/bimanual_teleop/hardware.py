@@ -40,6 +40,7 @@ import numpy as np
 from .arms.joint_map import load_joint_map, map_file_from_rig, rest_pose_gate
 from .config import SIDES
 from .logging_utils import get_logger
+from .safety.runtime_guard import GuardTrip, RuntimeGuard, effective_rate_limit
 from .safety.shaper import JointCommandShaper
 
 log = get_logger("hardware")
@@ -47,12 +48,15 @@ log = get_logger("hardware")
 
 def arm_shaper(rig: dict, q0) -> JointCommandShaper:
     """The hardware-boundary shaper for one YAM arm, from rig config. Factored out
-    so the safety wiring is unit-testable without the i2rt SDK."""
+    so the safety wiring is unit-testable without the i2rt SDK. The per-joint speed
+    cap is `effective_rate_limit` — `hardware.rate_limit` clamped DOWN to the
+    absolute ceiling `safety.runtime.hard_max_joint_speed`, so nothing this sink
+    emits can ever exceed that ceiling regardless of config or CLI flags."""
     hw = rig.get("hardware", {})
     limits = rig["arms"]["joint_limits"]
     return JointCommandShaper(
         q0,
-        rate_limit=float(hw.get("rate_limit", 1.2)),
+        rate_limit=effective_rate_limit(rig),
         smooth_hz=float(hw.get("smooth_hz", 3.0)),
         accel_limit=float(hw.get("accel_limit", 12.0)),
         lo=limits["lower"],
@@ -75,7 +79,7 @@ class HardwareSink:
         hw = rig.get("hardware", {})
         self.sides = active_sides(rig)
         self.use_hands = bool(hw.get("use_hands", True))
-        tol = float(hw.get("engage_pose_tol", 0.15))
+        tol = hw.get("engage_pose_tol", 0.15)   # scalar or per-joint list (rest_pose_gate handles both)
         map_file = map_file_from_rig(rig)
 
         skipped = [s for s in SIDES if s not in self.sides]
@@ -123,10 +127,75 @@ class HardwareSink:
                 self.close()
                 raise
 
+        # Continuous runtime safety monitor (tracking / thermal / overcurrent /
+        # loop-stall). Fed measured state + motor telemetry every set_arm tick; a
+        # GuardTrip releases torque on ALL arms and propagates to the run loop.
+        self.guard = RuntimeGuard(rig.get("safety", {}).get("runtime", {}), sides=self.sides)
+        self._tele: dict[str, dict] = {}
+        self._warn_t = 0.0
+        self._eff_rate = effective_rate_limit(rig)
+        self._hard_max = rig.get("safety", {}).get("runtime", {}).get("hard_max_joint_speed")
+
     def set_arm(self, side: str, q: np.ndarray) -> None:
         if side not in self.arms:
             return
-        self.arms[side].command(self.shapers[side].shape(q, time.monotonic()))
+        arm = self.arms[side]
+        now = time.monotonic()
+        cmd = self.shapers[side].shape(q, now)
+        arm.command(cmd)
+        if self.guard is None or not self.guard.enabled:
+            return
+        # Read what the metal is actually doing and run the guard. A telemetry read
+        # failure (CAN hiccup / non-hardware stub) skips this tick — the motor-side
+        # watchdog remains the backstop; a real trip raises and releases torque.
+        try:
+            pos, _vel, eff, temp = arm.chain.read()
+            measured = arm.map.to_model(np.asarray(pos, dtype=float)[:6])
+        except Exception as e:
+            log.debug("%s: telemetry read failed (%s) — guard skipped this tick", side, e)
+            return
+        self._tele[side] = {"cmd": [float(x) for x in np.asarray(cmd, float)[:6]],
+                            "measured": [float(x) for x in measured]}
+        try:
+            warns = self.guard.check(side, cmd, measured, effort=eff, temp=temp, t=now)
+        except GuardTrip as trip:
+            log.error("RUNTIME SAFETY TRIP — releasing torque on ALL arms: %s", trip)
+            self.release_all_torque()
+            raise
+        if warns and now - self._warn_t > 1.0:
+            log.warning("guard nearing a limit: %s", "; ".join(warns))
+            self._warn_t = now
+
+    def release_all_torque(self) -> None:
+        """Every wired arm goes LIMP immediately (panic button / guard trip / e-stop
+        request). The arm hangs under gravity; at rest that is the official resting
+        pose. Best-effort per arm so one failure never blocks the others."""
+        for a in getattr(self, "arms", {}).values():
+            try:
+                a.release_torque()
+            except Exception:
+                pass
+
+    def telemetry(self) -> dict:
+        """Snapshot of guard state + per-arm measured/commanded/gap/temp/effort for
+        the dashboard. Cheap; safe to call from the publish path."""
+        g = self.guard
+        out: dict = {
+            "enabled": bool(g.enabled) if g else False,
+            "trip": g.tripped if g else None,
+            "sides": list(self.sides),
+            "eff_rate": round(float(self._eff_rate), 3),
+            "hard_max_joint_speed": self._hard_max,
+            "limits": ({"track": g.max_track, "temp": g.max_temp,
+                        "current": g.max_curr, "warn_frac": g.warn_frac} if g else {}),
+            "arms": {},
+        }
+        if g:
+            for s in self.sides:
+                rec = dict(g.last.get(s, {}))
+                rec.update(self._tele.get(s, {}))
+                out["arms"][s] = rec
+        return out
 
     def set_hand(self, side: str, joints_deg: dict) -> None:
         if side not in self.hands:

@@ -10,13 +10,13 @@ jogging.
     uv run python scripts/jog_arms.py --sink hw          # REAL arms (Linux host)
 
 Keys:
-    UP / DOWN  jog selected joint + / - step    LEFT / RIGHT  select joint
-    TAB        switch side (left/right)         1..6   select joint
-    = / -      same as UP / DOWN                [ / ]  halve / double step
-    w / s      EE forward / back                a / d  EE left / right
-    r / f      EE up / down                     h      go home (rest pose)
-    p          print state                      m      print MEASURED pose (hw)
-    q,ESC  quit
+    a / d      jog selected joint - / +        1..6   select joint
+    [ / ]      halve / double step             TAB    switch side (left/right)
+    w / s      EE forward / back               z / c  EE left / right
+    r / f      EE up / down                    h      go home (rest pose)
+    m          print MEASURED pose (hw)        p      print state
+    SPACE / x  PANIC: torque off NOW (limp)    q, ESC quit
+    (arrows still work too: UP/DOWN jog joint, LEFT/RIGHT select)
 """
 from __future__ import annotations
 
@@ -36,6 +36,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from bimanual_teleop.config import SIDES, load_rig                  # noqa: E402
 from bimanual_teleop.arms.ik import ArmIK                           # noqa: E402
+from bimanual_teleop.safety.runtime_guard import GuardTrip          # noqa: E402
 from bimanual_teleop.vr.frames import SE3, quat_to_R                # noqa: E402
 
 
@@ -111,7 +112,22 @@ class JogSession:
         if hasattr(self.sink, "publish"):
             self.sink.publish(self.engine, None, {s: False for s in SIDES}, hz, t)
 
+    def live_line(self, meas: float | None = None, gap: float | None = None) -> str:
+        """Compact ONE-line status for the live in-place display. Kept well under
+        80 cols so it never wraps (wrapping is what defeats the \\r overwrite and
+        floods the screen). Shows the SELECTED joint — the thing a/d moves."""
+        j = self.joint
+        qj = np.degrees(self.ik[self.side].q[j])
+        s = (f"[{self.side[0].upper()}] j{j+1}  cmd {qj:+7.1f}°"
+             f"  step {np.degrees(self.joint_step):.1f}°")
+        if meas is not None:
+            arrow = "  <- MOVING" if (gap is not None and gap > 0.5) else ""
+            s += f"  |  meas {meas:+7.1f}°  gap {gap:4.1f}°{arrow}"
+        return s
+
     def status_line(self) -> str:
+        """Full 6-joint pose (the `p` key, and the test). Multi-line-safe: only
+        printed on its own fresh line, never as the in-place ticker."""
         q = np.degrees(self.ik[self.side].q)
         qs = " ".join(f"j{i+1}{'*' if i == self.joint else ''}={q[i]:+6.1f}" for i in range(6))
         return (f"[{self.side.upper()}] step={np.degrees(self.joint_step):.1f}°/"
@@ -143,9 +159,19 @@ class _Tee:
 
     def publish(self, *a, **k):
         try:
+            k.setdefault("hw", self.telemetry())
             self.render.publish(*a, **k)
         except Exception:
             pass
+
+    def release_all_torque(self):
+        try:
+            self.hw.release_all_torque()
+        except Exception:
+            pass
+
+    def telemetry(self):
+        return self.hw.telemetry() if hasattr(self.hw, "telemetry") else None
 
     def close(self):
         self.hw.close()
@@ -191,12 +217,20 @@ def main() -> int:
             jog.side = wired[0]
             print(f"[jog] starting on the wired side: {jog.side}")
     print(__doc__.split("Keys:")[1])
-    print(f"sink={args.sink}  |  watch on the dashboard: uv run python scripts/dashboard.py")
-    print(jog.status_line(), flush=True)
+    print(f"sink={args.sink}  |  watch on the dashboard at http://<host>:8180")
+    print("Press 1-6 to pick a joint, then tap a / d to move it (start with 1 — the "
+          "shoulder is easiest to see).")
+
+    def draw(meas: float | None = None, gap: float | None = None) -> None:
+        # ONE in-place line, truncated below the terminal width so it never wraps
+        # (a wrapped line is what made \r flood the screen). \033[K clears the rest.
+        sys.stdout.write("\r\033[K" + jog.live_line(meas, gap)[:79])
+        sys.stdout.flush()
 
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     tty.setcbreak(fd)
+    draw()
     t0 = time.monotonic()
     try:
         last_meas = 0.0
@@ -226,12 +260,12 @@ def main() -> int:
             for s in getattr(sink, "arms", {}):
                 sink.set_arm(s, jog.ik[s].q)
             jog.publish(60.0, t)
-            if getattr(sink, "arms", None) and now - last_meas > 0.5 and jog.side in sink.arms:
+            if getattr(sink, "arms", None) and now - last_meas > 0.25 and jog.side in sink.arms:
                 meas = np.degrees(sink.arms[jog.side].state())
                 cmd = np.degrees(jog.ik[jog.side].q)
-                gap = float(np.max(np.abs(((meas - cmd) + 180.0) % 360.0 - 180.0)))
-                print(f"\r{jog.status_line()} | meas j{jog.joint + 1}={meas[jog.joint]:+6.1f}° gap={gap:4.1f}°  ",
-                      end="", flush=True)
+                j = jog.joint
+                gapj = float(abs(((meas[j] - cmd[j]) + 180.0) % 360.0 - 180.0))
+                draw(meas[j], gapj)
                 last_meas = now
             if not select.select([sys.stdin], [], [], 1 / 60)[0]:
                 continue
@@ -279,31 +313,50 @@ def main() -> int:
             elif ch == "]":
                 jog.joint_step = min(np.radians(12.0), jog.joint_step * 2)
                 jog.ee_step = min(0.06, jog.ee_step * 2)
-            elif ch in "wsadrf":
+            elif ch == "d":
+                if not may_move("j"):
+                    continue
+                jog.step_joint(+1)
+            elif ch == "a":
+                if not may_move("j"):
+                    continue
+                jog.step_joint(-1)
+            elif ch in "wsrfzc":
                 if not may_move("e"):
                     continue
                 d = {"w": [-jog.ee_step, 0, 0],         # forward = world −X
                      "s": [+jog.ee_step, 0, 0],
-                     "a": [0, -jog.ee_step, 0],         # left = world −Y
-                     "d": [0, +jog.ee_step, 0],
+                     "z": [0, -jog.ee_step, 0],         # EE left = world −Y
+                     "c": [0, +jog.ee_step, 0],         # EE right = world +Y
                      "r": [0, 0, +jog.ee_step],
                      "f": [0, 0, -jog.ee_step]}[ch]
                 jog.nudge_ee(d)
+            elif ch in (" ", "x"):
+                rel = getattr(sink, "release_all_torque", None)
+                if rel is None:
+                    rel = getattr(getattr(sink, "hw", None), "release_all_torque", None)
+                if rel:
+                    rel()
+                sys.stdout.write("\r\033[K*** PANIC: torque released — arm is LIMP (hanging). quitting ***\n")
+                break
             elif ch == "h":
                 jog.home()
             elif ch == "m":
                 arms = getattr(sink, "arms", {})
                 if jog.side in arms:
                     meas = np.degrees(arms[jog.side].state())
-                    print(f"\n[{jog.side}] MEASURED  " +
-                          " ".join(f"j{i+1}={meas[i]:+6.1f}" for i in range(6)))
+                    sys.stdout.write("\r\033[K[" + jog.side + "] MEASURED  " +
+                          " ".join(f"j{i+1}={meas[i]:+6.1f}" for i in range(6)) + "\n")
             elif ch == "p":
-                pass                                     # status prints below anyway
+                sys.stdout.write("\r\033[K" + jog.status_line() + "\n")
             else:
                 continue
-            print("\r" + jog.status_line() + " " * 8, end="", flush=True)
+            draw()
     except KeyboardInterrupt:
         pass
+    except GuardTrip as trip:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        print(f"\n*** RUNTIME SAFETY TRIP — torque released, jog aborted ***\n    {trip}")
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
         print()
