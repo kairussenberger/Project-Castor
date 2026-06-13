@@ -38,17 +38,36 @@ def main() -> int:
     ap.add_argument("--record", metavar="PATH", default=None,
                     help="write VR frames + engage state to a replayable .npz session")
     ap.add_argument("--hz", type=float, default=None, help="override control rate")
+    ap.add_argument("--speed", type=float, default=1.0,
+                    help="replay time-stretch: 0.2 plays a recording 5x slower (replay only)")
+    ap.add_argument("--rate-limit", type=float, default=None, metavar="RAD_S",
+                    help="override hardware.rate_limit at the CAN shaper for this run")
+    ap.add_argument("--sides", default=None, metavar="right[,left]",
+                    help="override rig hardware.sides — arms physically wired this session")
+    ap.add_argument("--no-hands", action="store_true",
+                    help="override rig hardware.use_hands=false (ORCA hands not mounted)")
     args = ap.parse_args()
 
     if sys.platform == "darwin":
         print("WARNING: real YAM control needs Linux/SocketCAN; macOS can't run the CAN loop.")
 
     rig = load_rig()
+    hw = rig.setdefault("hardware", {})
+    if args.sides:
+        hw["sides"] = [s.strip() for s in args.sides.split(",") if s.strip()]
+    if args.no_hands:
+        hw["use_hands"] = False
+    print(f"[hw] arms: {hw.get('sides', ['left', 'right'])}  hands: {hw.get('use_hands', True)}  "
+          f"(rig hardware.sides / --sides; rest-pose gate ±"
+          f"{float(hw.get('engage_pose_tol', 0.15)):.2f} rad)")
     rig["vr"]["transport"] = args.vr
     if args.vr == "replay":
         if not args.replay_path:
             ap.error("--vr replay needs a session file: run_hw --vr replay session.npz")
         rig["vr"]["replay_path"] = args.replay_path
+        rig["vr"]["replay_speed"] = float(args.speed)
+        if args.speed != 1.0:
+            print(f"[hw] replay time-stretch x{1.0 / args.speed:.1f} slower (speed {args.speed})")
     hz = args.hz or rig["control"]["arm_hz"]
     # Hardware speed derating: scale the IK joint-velocity budget down for real
     # motors (the sink's JointCommandShaper independently caps speed again).
@@ -57,11 +76,49 @@ def main() -> int:
     print(f"[hw] ik.max_vel derated x{scale:.2f} -> {rig['ik']['max_vel']:.1f} rad/s; "
           f"shaper rate_limit {rig.get('hardware', {}).get('rate_limit', 1.2)} rad/s")
 
+    if args.rate_limit:
+        rig["hardware"]["rate_limit"] = float(args.rate_limit)
+        print(f"[hw] shaper rate_limit overridden -> {args.rate_limit:.2f} rad/s")
     src = make_source(rig)
     clutch = RecordedClutch(src) if args.clutch == "recorded" else GestureClutch()
 
     from ..hardware import HardwareSink
     sink = HardwareSink(rig)
+    render = None
+    try:
+        from ..render_sink import RenderSink
+
+        class _Tee:
+            def __init__(self, hw, rd):
+                self.hw, self.rd = hw, rd
+                self.arms = hw.arms
+
+            def set_arm(self, side, q):
+                self.hw.set_arm(side, q)
+                try:
+                    self.rd.set_arm(side, q)
+                except Exception:
+                    pass
+
+            def set_hand(self, side, j):
+                self.hw.set_hand(side, j)
+                try:
+                    self.rd.set_hand(side, j)
+                except Exception:
+                    pass
+
+            def close(self):
+                self.hw.close()
+                try:
+                    self.rd.close()
+                except Exception:
+                    pass
+
+        render = RenderSink(rig)
+        sink = _Tee(sink, render)
+        print("[hw] dashboard mirror on (render.state)")
+    except Exception as e:
+        print(f"[hw] dashboard mirror disabled ({e}) — hardware loop unaffected")
     engine = TeleopEngine(rig, sink)
     supervisor = Supervisor(rig, clutch)
     src.start()
@@ -77,6 +134,11 @@ def main() -> int:
             if recorder is not None and frame is not None:
                 recorder.add(frame, engaged, t)
             engine.tick(frame, engaged, t)
+            if render is not None:
+                try:
+                    render.publish(engine, frame, engaged, 1.0 / period, t)
+                except Exception:
+                    pass
             if push_calib:
                 src.set_calib(engine.calib_status)
             dt = period - (time.monotonic() - t)

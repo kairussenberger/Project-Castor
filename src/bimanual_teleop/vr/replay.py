@@ -87,8 +87,10 @@ class ReplaySource:
     """A VRSource that replays a recording. Matches FakeVRSource's interface
     (start/stop/latest/frame_at) so it drops straight into make_source / the engine."""
 
-    def __init__(self, path: str | None = None, *, data: dict | None = None, loop: bool = False):
+    def __init__(self, path: str | None = None, *, data: dict | None = None, loop: bool = False,
+                 speed: float = 1.0):
         self.loop = bool(loop)
+        self.speed = max(1e-3, float(speed))   # 0.2 = play 5x slower than recorded
         d = data if data is not None else dict(np.load(path, allow_pickle=False))
         self.t = np.asarray(d["t"], float)
         self.head = np.asarray(d["head"], float)
@@ -156,7 +158,7 @@ class ReplaySource:
             self._last_replay_t = float(self.t[0])
             return self.frame_at(self._last_replay_t)
         now = time.monotonic()
-        self._last_replay_t = float(self.t[0] + (now - self._t0_wall))
+        self._last_replay_t = float(self.t[0] + self.speed * (now - self._t0_wall))
         f = self.frame_at(self._last_replay_t)
         # The recorded timestamp drives deterministic sample selection, but live
         # supervisors compare frame.stamp to the current monotonic clock for
