@@ -163,6 +163,7 @@ class StateFeed:
         while not self._stop:
             try:
                 with socket.create_connection(self.addr, timeout=2.0) as sock:
+                    sock.settimeout(None)   # stream is silent between previews — only EOF means the publisher is gone
                     self.connected = True
                     f = sock.makefile("r", encoding="utf-8")
                     while not self._stop:
@@ -203,6 +204,17 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>bimanual-teleo
  .kv{display:flex;justify-content:space-between;color:var(--dim);font-size:12.5px;margin:2px 0}
  .kv b{color:var(--ink);font-weight:600;font-variant-numeric:tabular-nums}
  .err-ok{color:var(--green)} .err-bad{color:#ff8a8a}
+ .ctrlbar{display:flex;gap:9px;align-items:center;padding:9px 16px;background:#141925;border-bottom:1px solid #232936;flex-wrap:wrap}
+ .btn{cursor:pointer;border:0;border-radius:8px;padding:8px 16px;font-weight:700;color:#fff}
+ .btn.sm{padding:7px 11px;font-weight:600;font-size:13px}
+ .btn.live{background:#1e5d3a}.btn.stop{background:#6a2626}
+ .btn.kill{background:#b3261e;box-shadow:0 0 0 1px #e0584f inset}
+ .btn.cal{background:#8a6d1a}.btn.play{background:#2b4a7a}.btn.ghost{background:#3a3f4b;color:#cdd5df}
+ .btn:disabled{opacity:.4;cursor:not-allowed}
+ .sel{background:#222833;color:#dde3ea;border:1px solid #353c4a;border-radius:8px;padding:7px 9px;max-width:240px}
+ .meta{color:#8d97a5;font-size:12px;font-variant-numeric:tabular-nums}
+ .slider{vertical-align:middle;width:120px;accent-color:#6f9fe8}
+ .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;background:#0b0e13;border:1px solid #2a3340;border-radius:7px;color:#bcd0e6;padding:8px 10px}
 </style></head><body>
 <header><b>bimanual-teleop</b><span class=chip style="background:#2b3550">build __BUILD__</span>
  <span id=quest class=chip>QUEST …</span>
@@ -216,21 +228,37 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>bimanual-teleo
  <button class=chip style="cursor:pointer;border:0" onclick="setView(VIEW_DEFAULT.yaw,VIEW_DEFAULT.pitch)">reset view</button>
  <span class=chip id=age>age —</span>
 </header>
-<div style="display:flex;gap:10px;align-items:center;padding:10px 16px;background:#141925;border-bottom:1px solid #232936;flex-wrap:wrap">
- <button id=btnLive  style="cursor:pointer;border:0;border-radius:8px;padding:8px 18px;font-weight:700;background:#1e5d3a;color:#fff">&#9654; START LIVE (Quest)</button>
- <select id=selClutch title="always: arms follow whenever tracked. gesture: arms follow ONLY while you hold the thumb-pinky pinch (deadman) — use for finger-only work so parked means parked" style="background:#222833;color:#dde3ea;border:1px solid #353c4a;border-radius:8px;padding:7px">
+<div class=ctrlbar>
+ <button id=btnLive class="btn live">&#9654; START LIVE</button>
+ <select id=selClutch class=sel title="always: arms follow whenever tracked. gesture: arms follow ONLY while you hold the thumb-pinky pinch (deadman) — use for finger-only work so parked means parked">
   <option value=always selected>clutch: always</option>
   <option value=gesture>clutch: gesture</option>
  </select>
- <button id=btnStop  style="cursor:pointer;border:0;border-radius:8px;padding:8px 18px;font-weight:700;background:#7c2d2d;color:#fff">&#9632; STOP</button>
- <button id=btnCalib style="cursor:pointer;border:0;border-radius:8px;padding:8px 18px;font-weight:700;background:#8a6d1a;color:#fff">&#8853; CALIBRATE</button>
- <button id=btnCalClear title="clear the applied neutral-pose fit (back to 1:1)" style="cursor:pointer;border:0;border-radius:8px;padding:8px 10px;font-weight:600;background:#3a3f4b;color:#cdd5df;display:none">clear cal</button>
- <span style="width:14px"></span>
- <select id=selRec style="background:#222833;color:#dde3ea;border:1px solid #353c4a;border-radius:8px;padding:7px"></select>
- <label style="color:#9fb2c8;font-size:13px"><input type=checkbox id=chkLoop checked> loop</label>
- <button id=btnReplay style="cursor:pointer;border:0;border-radius:8px;padding:8px 18px;font-weight:700;background:#2b4a7a;color:#fff">&#9654; REPLAY</button>
- <span id=ctrlStatus style="color:#9fb2c8;font-size:13px;margin-left:8px">…</span>
- <span id=hint style="color:#e8b339;font-size:13px;font-weight:600;margin-left:8px"></span>
+ <button id=btnCalib class="btn cal">&#8853; CALIBRATE</button>
+ <button id=btnCalClear class="btn ghost sm" title="clear the applied neutral-pose fit (back to 1:1)" style="display:none">clear cal</button>
+ <span style="width:6px"></span>
+ <button id=btnStop class="btn stop" title="graceful stop of the dashboard's render engine (saves its recording)">&#9632; STOP</button>
+ <button id=btnKill class="btn kill" title="SIGINT every teleop / jog / bring-up / replay process on this host — clean torque release. NOT a substitute for the physical e-stop.">&#9888; STOP ALL</button>
+ <span id=ctrlStatus class=meta style="margin-left:6px">…</span>
+ <span id=hint style="color:#e8b339;font-size:13px;font-weight:600;margin-left:4px"></span>
+</div>
+<div class=ctrlbar>
+ <span class=meta style="font-weight:700;color:#9fb2c8;letter-spacing:.3px">REPLAY</span>
+ <select id=selRec class=sel></select>
+ <span id=recMeta class=meta>&mdash;</span>
+ <span style="width:6px"></span>
+ <label class=meta>speed <input id=spd class=slider type=range min=10 max=100 value=100 step=5></label>
+ <span id=spdLbl class=meta style="width:30px;display:inline-block;font-weight:700;color:#bcd0e6">1.0&times;</span>
+ <label class=meta><input type=checkbox id=chkLoop checked> loop</label>
+ <button id=btnReplay class="btn play sm" title="preview on the dashboard — render only, no robot">&#9654; PREVIEW</button>
+ <button id=btnAnalyze class="btn ghost sm" title="grade this recording against the mapping contracts (no robot)">analyze</button>
+ <span id=anaOut class=meta></span>
+ <span style="flex:1"></span>
+ <button id=btnMetal class="btn ghost sm" title="show the run_hw command that drives the RIGHT ARM with this recording">metal cmd &#9662;</button>
+</div>
+<div id=metalRow class=ctrlbar style="display:none;padding-top:0">
+ <code id=metalCmd class=mono style="flex:1;white-space:nowrap;overflow:auto"></code>
+ <button id=btnCopyMetal class="btn ghost sm">copy</button>
 </div>
 <div id=calBanner style="display:none;padding:12px 16px;background:#2b2410;border-bottom:2px solid #d4af37;align-items:center;gap:14px">
  <span style="font-size:20px">&#129337;</span>
@@ -424,6 +452,22 @@ function card(side,s){
 function chip(id,cls,txt){const e=$(id);e.className='chip '+cls;e.textContent=txt}
 async function control(params){try{const r=await fetch('/control?'+new URLSearchParams(params));updCtrl(await r.json())}catch(e){}}
 let CTRL=null;
+const speed=()=>$('spd').value/100;
+function metalCmd(){
+ const f=$('selRec').value; if(!f){$('metalCmd').textContent='— pick a recording —';return}
+ const sp=speed(), s=sp<1?` --speed ${sp.toFixed(2)}`:'';
+ $('metalCmd').textContent=`python -m bimanual_teleop.launch.run_hw --vr replay ${f} --clutch recorded${s} --rate-limit 0.5`;
+}
+async function refreshRec(){
+ const f=$('selRec').value, m=$('recMeta');
+ metalCmd();
+ if(!f){m.textContent='—';return}
+ try{const r=await(await fetch('/recinfo?file='+encodeURIComponent(f))).json();
+  m.textContent=r.error?('⚠ '+r.error)
+   :`${r.dur.toFixed(1)}s · ${r.frames}f · engaged ${(r.engaged*100).toFixed(0)}% · R ${(r.right*100).toFixed(0)}%`;
+  m.style.color=r.error?'#e8b339':'#8d97a5';
+ }catch(e){m.textContent=''}
+}
 function updCtrl(c){
  if(!c)return;
  CTRL=c;
@@ -437,12 +481,26 @@ function updCtrl(c){
  if(c.recordings && sel.options.length !== c.recordings.length){
   const cur=sel.value; sel.innerHTML='';
   for(const r of c.recordings){const o=document.createElement('option');o.value=r;o.textContent=r.split('/').pop();sel.appendChild(o)}
-  if(cur)sel.value=cur;
+  sel.value = (cur && c.recordings.includes(cur)) ? cur : (c.recordings[0]||'');
+  refreshRec();
  }
 }
 $('btnLive').onclick=()=>control({action:'start_live',clutch:$('selClutch').value});
 $('btnStop').onclick=()=>control({action:'stop'});
-$('btnReplay').onclick=()=>{const f=$('selRec').value;if(f)control({action:'start_replay',file:f,loop:$('chkLoop').checked?'1':'0'})};
+$('btnKill').onclick=()=>control({action:'kill_all'});
+$('btnReplay').onclick=()=>{const f=$('selRec').value;
+ if(f)control({action:'start_replay',file:f,loop:$('chkLoop').checked?'1':'0',speed:speed().toFixed(2)})};
+$('selRec').onchange=refreshRec;
+$('spd').oninput=()=>{$('spdLbl').innerHTML=speed().toFixed(1)+'&times;';metalCmd()};
+$('btnMetal').onclick=()=>{const r=$('metalRow');r.style.display=r.style.display==='none'?'flex':'none';metalCmd()};
+$('btnCopyMetal').onclick=()=>{navigator.clipboard.writeText($('metalCmd').textContent);
+ $('btnCopyMetal').textContent='copied';setTimeout(()=>$('btnCopyMetal').textContent='copy',1200)};
+$('btnAnalyze').onclick=async()=>{const f=$('selRec').value;if(!f)return;
+ const o=$('anaOut');o.textContent='analyzing…';o.style.color='#8d97a5';
+ try{const r=await(await fetch('/analyze?file='+encodeURIComponent(f))).json();
+  o.textContent=r.error?('⚠ '+r.error):r.verdict;
+  o.style.color=r.error?'#e8b339':(r.ok?'#41d98d':'#ff8a8a');o.title=r.detail||'';
+ }catch(e){o.textContent='⚠ analyze failed'}};
 let CAL_ACTIVE=false;
 let WSEMA={left:0,right:0};
 $('btnCalib').onclick=()=>control({action:CAL_ACTIVE?'calibrate_cancel':'calibrate'});
@@ -532,6 +590,38 @@ async function tick(){
 }
 tick();
 </script></body></html>"""
+
+
+def recording_info(path: Path) -> dict:
+    """Cheap metadata for the recordings browser: duration, frames, engaged and
+    right-tracked fractions. Fail-soft (corrupt .npz exist — e.g. truncated
+    pre-atomic-save sessions)."""
+    try:
+        d = np.load(path, allow_pickle=False)
+        t = np.asarray(d["t"], float)
+        dur = float(t[-1] - t[0]) if t.size else 0.0
+        eng = np.asarray(d["engaged"]) if "engaged" in d else None
+        rt = np.asarray(d["right_tracked"]) if "right_tracked" in d else None
+        return {"frames": int(t.size), "dur": dur,
+                "engaged": float(eng.mean()) if eng is not None and eng.size else 0.0,
+                "right": float(rt.mean()) if rt is not None and rt.size else 0.0}
+    except Exception as e:
+        return {"error": type(e).__name__}
+
+
+def analyze_recording(path: Path) -> dict:
+    """Run the offline contract grader (no robot) and surface its OVERALL verdict.
+    Loads the IK model, so it takes a few seconds — on demand only."""
+    try:
+        r = subprocess.run([_sys.executable, "scripts/analyze_session.py", str(path)],
+                           cwd=REPO_ROOT, capture_output=True, text=True, timeout=90)
+    except subprocess.TimeoutExpired:
+        return {"error": "analyze timed out"}
+    out = (r.stdout or "") + (r.stderr or "")
+    verdict = next((ln.strip() for ln in reversed(out.splitlines()) if "OVERALL" in ln), "")
+    if not verdict:
+        return {"error": "no verdict — see out/engine.log"}
+    return {"ok": "PASS" in verdict, "verdict": verdict, "detail": out[-1500:]}
 
 
 def rig_info() -> dict:
@@ -699,9 +789,51 @@ class EngineManager:
         return self._start(["--vr", "orbit", "--clutch", clutch, "--record", rec],
                            f"LIVE ({clutch})", rec)
 
-    def start_replay(self, file: str, loop: bool):
+    def start_replay(self, file: str, loop: bool, speed: float = 1.0):
         args = ["--vr", "replay", file] + (["--loop"] if loop else [])
-        return self._start(args, f"REPLAY {Path(file).name}" + (" (loop)" if loop else ""), None)
+        if speed != 1.0:
+            args += ["--speed", f"{speed:g}"]
+        label = f"REPLAY {Path(file).name}"
+        if speed != 1.0:
+            label += f" @{speed:g}x"
+        if loop:
+            label += " (loop)"
+        return self._start(args, label, None)
+
+    # STOP ALL targets: everything that can move metal or hold the CAN bus. The
+    # dashboard's own render engine (run_teleop) is stopped gracefully first via
+    # _stop_inner (saves its recording); these get SIGINT so run_hw's finally
+    # block releases torque, with SIGKILL only for the stubborn.
+    KILL_TARGETS = (
+        (r"scripts/jog_arms\.py", "jog_arms"),
+        (r"scripts/jog_right\.py", "jog_right"),
+        (r"scripts/hw_bringup\.py", "hw_bringup"),
+        (r"scripts/probe_nudge\.py", "probe_nudge"),
+        (r"scripts/test_pattern\.py", "test_pattern"),
+        (r"bimanual_teleop\.launch\.run_hw", "run_hw"),
+    )
+
+    def _matches(self, pat):
+        return subprocess.run(["pgrep", "-f", pat], capture_output=True).returncode == 0
+
+    def kill_all(self):
+        with self._lock:
+            self._stop_inner()                          # graceful: render engine + its recording
+            hit = [name for pat, name in self.KILL_TARGETS if self._matches(pat)]
+            for pat, _ in self.KILL_TARGETS:
+                if self._matches(pat):
+                    subprocess.run(["pkill", "-INT", "-f", pat], capture_output=True)
+            if hit:
+                deadline = time.time() + 8.0
+                while any(self._matches(p) for p, _ in self.KILL_TARGETS) and time.time() < deadline:
+                    time.sleep(0.3)
+                for pat, _ in self.KILL_TARGETS:        # escalate only the stubborn
+                    if self._matches(pat):
+                        subprocess.run(["pkill", "-9", "-f", pat], capture_output=True)
+                self.last_msg = f"STOP ALL — signalled {', '.join(hit)} (torque released)"
+            else:
+                self.last_msg = "STOP ALL — nothing else was running"
+            return self.status()
 
     def _stop_inner(self):
         if self.adopted:
@@ -763,9 +895,15 @@ class EngineManager:
             f = (query.get("file") or [""])[0]
             if not f or not (REPO_ROOT / f).exists():
                 return {"error": f"no such recording: {f}", **self.status()}
-            return self.start_replay(f, (query.get("loop") or ["0"])[0] == "1")
+            try:
+                sp = float((query.get("speed") or ["1"])[0])
+            except ValueError:
+                sp = 1.0
+            return self.start_replay(f, (query.get("loop") or ["0"])[0] == "1", sp)
         if action == "stop":
             return self.stop()
+        if action == "kill_all":
+            return self.kill_all()
         if action in ("calibrate", "calibrate_cancel", "calibrate_clear"):
             return self.engine_cmd(action)
         return self.status()
@@ -833,6 +971,17 @@ def make_server(feed: StateFeed, host: str, port: int, rig: dict | None = None,
             elif self.path.startswith("/control"):
                 q = parse_qs(urlparse(self.path).query)
                 out = manager.dispatch(q) if manager else {"error": "no manager"}
+                body = json.dumps(out).encode()
+                ctype = "application/json"
+            elif self.path.startswith("/recinfo") or self.path.startswith("/analyze"):
+                q = parse_qs(urlparse(self.path).query)
+                f = (q.get("file") or [""])[0]
+                p = REPO_ROOT / f
+                if not f or ".." in f or not p.exists():
+                    out = {"error": "no such recording"}
+                else:
+                    out = (recording_info(p) if self.path.startswith("/recinfo")
+                           else analyze_recording(p))
                 body = json.dumps(out).encode()
                 ctype = "application/json"
             else:
