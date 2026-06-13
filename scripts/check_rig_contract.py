@@ -149,6 +149,16 @@ def main() -> int:
     smooth = float(hw.get("smooth_hz", float("nan")))
     require(np.isfinite(smooth) and 0.0 < smooth <= 12.0,
             "hardware.smooth_hz must be finite in (0, 12] (command-shaper bandwidth)")
+    sides = hw.get("sides", list(SIDES))
+    require(isinstance(sides, list) and len(sides) > 0 and all(s in SIDES for s in sides),
+            "hardware.sides must be a non-empty subset of left/right — the arms actually wired")
+    require(isinstance(hw.get("use_hands"), bool),
+            "hardware.use_hands must be an explicit bool (RealHand MOVES the hand at connect)")
+    tol = float(hw.get("engage_pose_tol", float("nan")))
+    require(np.isfinite(tol) and 0.0 < tol <= 0.35,
+            "hardware.engage_pose_tol must be in (0, 0.35] rad — the rest-pose gate must stay meaningful")
+    require(str(hw.get("joint_map_file", "")).endswith(".json"),
+            "hardware.joint_map_file must point at the per-machine motor↔model calibration json")
 
     workspace = rig.get("safety", {}).get("workspace", {})
     wmin = check_vector("safety.workspace.min", workspace.get("min"), 3)

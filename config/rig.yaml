@@ -17,14 +17,14 @@ arms:
   # stand's Y-face plates; hand_pos/hand_euler are the measured flange→ORCA-hand
   # transform; neutral_q is the home pose (j1=±90° → arms face forward, world −X).
   left:
-    can_channel: can0                  # hardware (Linux): SocketCAN interface for this arm
+    can_channel: can1                  # hardware (Linux): SocketCAN interface — NOT WIRED YET (see hardware.sides)
     base_pos: [-0.0248, -0.1700, 1.1908]   # Kai c2814b4: +0.5m on the real elongated stand (0.69->1.19)
     base_quat: [0.49791, 0.50194, -0.50011, -0.50004]
     hand_pos: [-0.0504, 0.1078, 0.0]   # flange (link5) → ORCA hand base
     hand_euler: [0.0, 3.14159, 0.0]    # palm-down, thumb-inward at home
     neutral_q: [3.137, -0.004, 0.305, -0.162, -0.003, -1.571]   # FROZEN official rest pose — see docs/RESTING_POSE.md, DO NOT CHANGE. ragdoll hang + j6 -90° palm-inward
   right:
-    can_channel: can1
+    can_channel: can0                  # single gs_usb adapter today = right arm; VERIFY with scripts/hw_bringup.py --step scan
     base_pos: [0.0101, 0.0801, 1.1875]   # Kai c2814b4: +0.5m on the real elongated stand (0.69->1.19)
     base_quat: [0.49989, 0.49988, 0.50055, 0.49968]
     hand_pos: [-0.0306, 0.1078, 0.0]
@@ -174,6 +174,21 @@ hardware:
   max_vel_scale: 0.35 # derate ik.max_vel for real motors (sim keeps full speed)
   rate_limit: 1.2     # rad/s hard per-joint speed cap at the CAN boundary
   smooth_hz: 3.0      # critically-damped command tracker bandwidth (the "PD" feel)
+  # Which arms are physically wired — ONLY these are opened/commanded; the
+  # engine's output for other sides is dropped at the sink. Add 'left' when its
+  # CAN adapter is connected (and verified with hw_bringup --step scan).
+  sides: [right]
+  # ORCA hands: RealHand MOVES the hand to neutral at connect — keep false until
+  # the hands are mounted, tensioned, and on their serial buses.
+  use_hands: false
+  # Rest-pose engage gate (rad, per joint): a session refuses to start unless each
+  # wired arm MEASURES at the official resting pose (docs/RESTING_POSE.md) through
+  # its calibrated joint map. Catches wrong-arm-on-bus (j6 differs by π), ±2π boot
+  # wraps, zero drift, and not-at-rest starts — before any tracking torque.
+  engage_pose_tol: 0.15
+  # Per-machine motor↔model joint calibration written by scripts/hw_bringup.py
+  # (signs measured on metal; offsets anchored at the resting pose). Gitignored.
+  joint_map_file: config/hw_joint_map.json
 
 vr:
   transport: fake     # 'fake' (synthetic, no headset) or 'vuer' (real Quest WebXR)

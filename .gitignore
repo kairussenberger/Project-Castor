@@ -33,3 +33,5 @@ unity/TeleopRenderer/Builds/
 !docs/media/*
 # operator neutral-pose calibration (per-machine/per-operator runtime state)
 config/operator_calib.json
+# motor↔model joint calibration measured on THIS rig's motors (scripts/hw_bringup.py)
+config/hw_joint_map.json
