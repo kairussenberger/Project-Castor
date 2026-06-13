@@ -3,6 +3,115 @@
 The repository has been reworked away from the old local MuJoCo simulator toward a
 headless body-relative teleop runtime with a Unity render stream.
 
+## 2026-06-12 (metal day complete: jog + real-speed replay on the right arm; dashboard replay studio)
+
+The right arm passed the full sim→real checklist on can0. Bring-up ran clean:
+`--step scan` found exactly motors 1..6 (no stock gripper on the bus), `--step
+rest` measured a still hang (drift 0.02°), `--step signs` measured the
+motor↔model direction signs **[+1,+1,−1,−1,+1,+1]** (j3/j4 inverted vs the
+model) and wrote config/hw_joint_map.json (offsets anchored at the official
+rest, gate 0.0°/joint), `--step verify` + `--step watchdog` passed, the keyboard
+jog moved every joint and EE-nudged with the metal tracking the dashboard, and a
+synthesized 46 s bimanual episode (recordings/bimanual_demo.npz — raise / reach /
+sweep + ±35° wrist rolls + finger curls; analyzer PASS, 0.1 cm correspondence)
+replayed on the metal at REAL speed. Operator verdict: "mapping is good for the
+right arm."
+
+Tooling hardened during the session (each was a real fault that made a working
+system look dead):
+
+- **rest-pose gate** now compares SHORTEST-ARC: j2 rests 1.8° from ±180°, so the
+  wrap-normalizer's branch choice flips between sessions; the raw difference
+  false-alarmed −352.7°.
+- **jog** (`scripts/jog_arms.py`): re-asserts the target every 60 Hz tick (the
+  hardware shaper is a tracker — one call per keypress moved one rate-limited
+  step and parked, silently diverging metal from page); ARROW keys jog/select
+  (raw `os.read` — buffered stdin made ↑ quit the session); motion keys gated to
+  the metal's tracking speed (autorepeat ran the commanded target away to +320°);
+  a live `meas jN / gap` encoder readout; a render-mirror tee so the dashboard
+  shadows the jog 1:1; `--side` for single-arm bring-up.
+- **replay speed**: `ReplaySource.speed` time-stretches a recording;
+  `run_hw` / `run_teleop --speed 0.2` plays 5× slower; `run_hw --rate-limit` and a
+  dashboard mirror tee added. `probe_nudge.py` = one-command instrumented nudge
+  (telemetry proof of motion); `test_pattern.py` = no-robot dashboard wave.
+- **dashboard replay studio** (`scripts/dashboard.py`): recordings browser with
+  per-file metadata (duration / frames / engaged %) and an `analyze` button
+  (offline contract grader), a speed slider (drives PREVIEW and the composed
+  metal command), a copy-paste `run_hw` command for the right arm, and a red
+  **STOP ALL** that SIGINTs every teleop / jog / bring-up / replay process on the
+  host (clean torque release). The page still launches PREVIEW only — metal stays
+  a terminal command with a hand on the e-stop. New `/recinfo` + `/analyze`
+  read-only endpoints.
+
+Reminders for the other side: only the RIGHT arm is wired (can0;
+`hardware.sides: [right]`, `use_hands: false`); the joint map is per-machine
+(config/hw_joint_map.json, gitignored — re-measure with `hw_bringup` on a
+different rig); after any torque release the limp wrist sags, so re-run `--step
+rest` (re-anchors offsets) at the start of a session, and expect a few degrees of
+gravity sag when the arm is held far from the hang (PD without feedforward).
+Browse the dashboard at http://&lt;host&gt;:8180 (binds 0.0.0.0; no ssh tunnel).
+
+## 2026-06-11 (sim→real boundary: measured joint map, rest-pose gate, guided bring-up)
+
+First metal session prep (right arm only, single gs_usb adapter on can0). Reading
+the i2rt SDK (v1.1.2, editable at ~/i2rt) surfaced three pre-metal hazards:
+
+1. **i2rt's energize defaults are wrong for this rig.** Constructing
+   `get_yam_robot()` starts a 250 Hz stream immediately, in zero-gravity mode
+   with gravity-comp torques from a MuJoCo model that assumes a TABLE-MOUNTED
+   YAM — our arms hang SIDEWAYS, so those torques push the wrong way at process
+   start. `YamArm` now constructs with `zero_gravity_mode=False` +
+   `gravity_comp_factor=zeros(6)`: energize = MIT PD holding the MEASURED pose,
+   zero motion, gravity as a bounded PD disturbance (kp 80/80/80/40/10/10).
+2. **The firmware joint convention is NOT the repo convention.** i2rt yam.xml:
+   j1∈[−2.62, 3.05], j2∈[0, 3.65], j3∈[0, 3.67] vs rig.yaml j1∈[0, 2π] (hang at
+   j1≈π!), j2∈[−2.88, 0.44], j3∈[−1.40, 2.44] — different zeros, unknown signs,
+   and i2rt ±2π-wraps any boot reading past π. Raw model-space commands could
+   sweep the arm. New `arms/joint_map.py`: per-side affine map (signs measured
+   on metal, offsets anchored at the official rest pose), persisted per-machine
+   in `config/hw_joint_map.json` (gitignored). `YamArm` refuses to command
+   without it.
+3. **Partial rig + wrong-bus hazards.** rig.yaml had left→can0 but the physical
+   right arm is on can0 (only adapter present; can1 doesn't exist). Channels
+   swapped; `hardware.sides: [right]` + `use_hands: false` (RealHand MOVES the
+   hand at connect) gate what HardwareSink may open; and a REST-POSE ENGAGE GATE
+   (±`engage_pose_tol`/joint through the map) refuses sessions where the arm
+   isn't measurably at rest — which also catches a wrong arm on the bus (left vs
+   right j6 differ by π), ±2π boot wraps, and zero drift, before any tracking.
+
+New guided bring-up: `scripts/hw_bringup.py` (links → scan → rest → signs →
+verify → watchdog), chain-level (no i2rt model assumptions), every motion ±2-3°
+around rest at ≤10°/s with explicit confirmations; `signs` mirrors each nudge on
+the dashboard so the operator just answers same/opposite; `watchdog` validates
+the motor-side deadman by stopping the stream mid-hold. `jog_arms --sink hw` now
+defaults to a 10°/s cap, starts on a wired side, prints MEASURED pose on `m`;
+`jog_right.py` is a deprecation shim (its old form pushed unmapped model angles
+with i2rt default energize). `run_hw` gained `--sides/--no-hands`. Failsafe rows
+12a–12d + a rewritten hardware-day checklist in docs/ARCHITECTURE.md; rig
+contract now pins the new hardware keys. Tests: `test_joint_map.py` (8) +
+`test_hardware_gate.py` (5); verify_stack passes (212 tests + probes/smokes).
+
+Open items for the metal day: does the hanging pose pass i2rt's boot qpos check
+(rest step predicts it); is the motor CAN watchdog configured (watchdog step
+verifies; `set_timeout.py` fixes); measure the actual signs.
+
+**Metal addendum (same day):** first contact answered the boot-check question —
+NO. A default-config i2rt run on can0 (LINEAR_4310 path, not our stack) reached
+`MotorChainRobot`'s qpos check and was rejected: at the hang the motors read
+j2≈−3.088 rad (−177°) and j6≈+5.438 rad (+312°) — the zeros follow neither
+i2rt's convention nor ours, and a >π reading survived i2rt's single-shot boot
+wrap fix. (That run also got far enough to prove the whole chain answers —
+including, apparently, a motor at ID 7: scan will confirm whether the stock
+gripper is still on the bus.) Consequence: the runtime CANNOT go through
+MotorChainRobot at all. `YamArm` now drives the chain directly via the new
+`arms/yam_chain.py` (promoted from hw_bringup's ChainSession): enable limp →
+multi-turn wrap normalization from a FRESH post-thread read (`wrap_corrections`,
+unit-pinned — handles the observed +312°) → MIT PD hold at measured, stock yam
+gains, no feedforward, motor-space clamp = the mapped model limits (i2rt xml
+limits are meaningless under these zeros). i2rt's boot verdict table in
+`--step rest` is now informational (it only governs i2rt's own tools).
+verify_stack green (213 tests).
+
 ## 2026-06-10 (absolute orientation — the overlay-overlap fix)
 
 Operator, looking at the dashboard overlay: the tracked hand skeleton and the

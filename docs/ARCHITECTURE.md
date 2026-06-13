@@ -90,7 +90,11 @@ degrees (never goes through arm IK).
 | 11 | IK velocity budget | `arms/ik.py` | per-joint `ik.max_vel`, derated ×`hardware.max_vel_scale` on run_hw | run_hw derate print |
 | 11b | **Target governor** | `arm_control.py` `_govern` | critically-damped second-order tracker of the commanded EE target (position AND attitude) under per-second velocity + ACCELERATION caps (`target_speed_max`/`target_accel_max`, `target_ang_speed_max`/`target_ang_accel_max`) — demands leave as smooth S-curves, never rectangle-velocity "blocky" glides; teleport-speed input (`target_jump_speed`) re-anchors instead of moving; frame-rate independent (sub-stepped real-dt integration) | `tests/test_guardrails.py` governor accel/speed/teleport/rate-independence |
 | 12 | **Command shaper** | `safety/shaper.py` @ `HardwareSink` | every CAN command limit-clamped to the PHYSICAL hardstops, speed-capped (`hardware.rate_limit`), acceleration-capped (`hardware.accel_limit` — velocity ramps, never slams), critically-damped PD smoothing, init from measured pose, NaN ⇒ hold | `tests/test_shaper.py` (8 tests) |
-| 13 | Motor-side backstops | YAM firmware | MIT-mode PD + 400 ms motor watchdog (commands stop ⇒ motors stop) | hardware-day check |
+| 12a | **Motor↔model joint map** | `arms/joint_map.py` @ `YamArm` | the i2rt firmware and this repo use DIFFERENT joint zeros/signs (i2rt yam.xml j1∈[−2.6,3.05] vs rig j1∈[0,2π]); every command/state crosses a per-side affine map MEASURED on metal (`scripts/hw_bringup.py`); an unmapped YamArm refuses model-space commands | `tests/test_joint_map.py` |
+| 12b | **Rest-pose engage gate** | `hardware.py` | a session only starts commanding an arm that MEASURES at the official rest pose (±`hardware.engage_pose_tol`/joint through the map) — catches wrong-arm-on-bus (j6 differs by π), ±2π boot wraps, zero drift, not-at-rest starts; fail = abort with per-joint deltas, torque released | `tests/test_hardware_gate.py` |
+| 12c | **Energize policy** | `arms/yam_chain.py` @ `YamArm` | the runtime drives the CAN chain DIRECTLY — i2rt's MotorChainRobot is not used (its boot/runtime qpos checks assume i2rt zero conventions this rig's motors don't follow — confirmed on metal: hang reads j2≈−177°, j6≈+312°; its gravity comp assumes a TABLE mount). Energize = enable limp → wrap-normalize offsets from a fresh read → MIT PD holds the MEASURED pose; zero motion, no feedforward, motor-space clamp = mapped model limits; close() releases torque then switches motors OFF | `test_wrap_corrections_normalize_multiturn_readings` + bring-up steps |
+| 12d | Partial-rig guard | `hardware.py` | only arms in `hardware.sides` are opened/commanded (engine output for others is dropped); `hardware.use_hands: false` skips ORCA entirely (RealHand MOVES the hand at connect) | `tests/test_hardware_gate.py` |
+| 13 | Motor-side backstops | YAM firmware | MIT-mode PD + motor CAN watchdog (commands stop ⇒ motors stop) — VERIFY per rig: `scripts/hw_bringup.py --step watchdog`; configure via i2rt `motor_config_tool/set_timeout.py` | bring-up watchdog step |
 
 Order matters: 1–5 decide *whether* to follow, 6–11 decide *where* to go, 12–13
 bound *how fast anything can physically move* no matter what upstream does.
@@ -102,7 +106,12 @@ bound *how fast anything can physically move* no matter what upstream does.
 | Full hardware-free acceptance gate | `uv run python scripts/verify_stack.py` |
 | Preflight doctor (strays, ports, quest link, calib grade/age, iCloud-venv trap) | `uv run python scripts/doctor.py [--fix]` |
 | Live dashboard (status, 3D, joint angles) | `uv run python scripts/dashboard.py` → http://127.0.0.1:8180 |
-| Keyboard jog (sim→real verification) | `uv run python scripts/jog_arms.py [--sink hw]` |
+| Guided first-contact bring-up (scan/rest/signs/verify/watchdog) | `uv run python scripts/hw_bringup.py [--step STEP]` |
+| Keyboard jog (sim→real verification) | `uv run python scripts/jog_arms.py [--sink hw] [--side right]` |
+| Instrumented single nudge (telemetry proof of motion) | `uv run python scripts/probe_nudge.py` |
+| No-robot dashboard test pattern | `uv run python scripts/test_pattern.py` |
+| Replay a recording at reduced speed | `run_hw --vr replay s.npz --speed 0.2 --rate-limit 0.5` |
+| Dashboard replay studio (browser: recordings, analyze, speed, STOP ALL) | `uv run python scripts/dashboard.py --host 0.0.0.0` → http://&lt;host&gt;:8180 |
 | Record a headset session | `run_teleop --vr orbit --record recordings/s.npz` |
 | Score a recording vs the contracts | `uv run python scripts/analyze_session.py recordings/s.npz` |
 | Curate a tape (trim, embed its session fit) | `uv run python scripts/trim_session.py recordings/s.npz --tail 4 [--calib fit.json]` |
@@ -114,34 +123,56 @@ bound *how fast anything can physically move* no matter what upstream does.
 ## Sim→Real Checklist (the Linux hardware day)
 
 The Mac never talks to motors; the Linux host runs the SAME engine with the
-HardwareSink. In order:
+HardwareSink. The arm starts AND ends every session hanging at the official rest
+pose (docs/RESTING_POSE.md) — that pose anchors the motor↔model calibration and
+the engage gate. In order:
 
 1. **Host prep**: Ubuntu, `sudo ip link set can0 up type can bitrate 1000000`
-   (and can1), `uv pip install -e i2rt`, ORCA hands tensioned/calibrated.
+   (and can1 when the second arm arrives), `uv pip install -e i2rt`. Set
+   `hardware.sides` / `hardware.use_hands` in rig.yaml to what is PHYSICALLY
+   wired (hands stay false until mounted — RealHand moves them at connect).
 2. **Gate**: `uv run python scripts/verify_stack.py` on the Linux host (everything
    that passes on the Mac must pass there).
 3. **Static**: power arms in a clear volume at the rest pose. Start
    `scripts/dashboard.py` on the host; confirm stream + joint angles.
-4. **Keyboard jog first — no headset**: `scripts/jog_arms.py --sink hw`. Single
-   joint ±3°, every joint, both arms; then EE nudges. Confirm: motion direction
-   matches the dashboard/sim, speed feels like the shaper cap (`rate_limit` 1.2
-   rad/s default — slow), hardstops respected. THIS is the sim→real transfer
-   check, with your hand on the e-stop.
-5. **Replay on hardware**: `run_hw --vr replay replay_library/roll_right_left.npz`
+4. **Guided bring-up (first metal contact, per arm)**: arm hanging at rest,
+   e-stop in hand, dashboard up — `uv run python scripts/hw_bringup.py`.
+   Steps: `links` (bus up) → `scan` (exactly motors 1..6 answer) → `rest`
+   (capture the hanging pose; i2rt boot-check verdict) → `signs` (±2°
+   motor-space nudges vs dashboard preview ⇒ measured per-joint signs)
+   → `verify` (±3° model-space wiggles THROUGH the saved map: dashboard and
+   metal must match on every joint) → `watchdog` (stop the stream mid-hold;
+   motors must go limp on their own). Writes `config/hw_joint_map.json`.
+   Re-run `--step rest` whenever the rest-pose gate complains (±2π boot wraps).
+5. **Keyboard jog — no headset**: `scripts/jog_arms.py --sink hw [--side right]`
+   (10°/s cap by default; `m` prints the MEASURED pose). Single joint ±3°, every
+   joint, then EE nudges. Confirm: motion direction matches the dashboard/sim,
+   speed feels like the shaper cap (`rate_limit` 1.2 rad/s default — slow),
+   hardstops respected. THIS is the sim→real transfer check, hand on the e-stop.
+   For an instrumented, telemetry-logged single nudge that takes EXTREME care of
+   the starting pose, use `scripts/probe_nudge.py` (or the multi-joint
+   `scripts/test_pattern.py`) — both refuse to move unless the arm is at rest.
+6. **Replay on hardware**: `run_hw --vr replay replay_library/roll_right_left.npz`
    — a curated COMMITTED tape you have already watched in sim (see
    docs/REPLAY_LIBRARY.md; tapes embed their session calibration, so a fresh
    clone has them), now on metal. No surprises allowed: same motion, slower
-   (derated). Then reach_box.npz, wrist_swing.npz; clap.npz only after the
-   crossing issue is closed.
-6. **Live teleop, gesture clutch**: `run_hw --vr orbit --clutch gesture`.
-   Engage one hand at a time. Verify dropout HOLD by covering a hand; verify
-   deadman by un-pinching; verify Ctrl+C releases torque.
-7. Only then consider raising `hardware.max_vel_scale` / `rate_limit`
+   (derated, add `--speed 0.2`). Then reach_box.npz, wrist_swing.npz; clap.npz
+   only after the crossing issue is closed.
+7. **Live teleop, gesture clutch**: `run_hw --vr orbit --clutch gesture`.
+   Engage one hand at a time (lift the right hand first, confirm, then the
+   left). Verify dropout HOLD by covering a hand; verify deadman by releasing
+   the gesture; verify Ctrl+C releases torque and the arm settles to the hang.
+8. Only then consider raising `hardware.max_vel_scale` / `rate_limit`
    incrementally.
 
 Known unknowns to verify on metal (cannot be tested here): CAN bus latency under
-both arms + hands, YamArm 5-vs-6 motor enumeration padding (see
-`arms/yam_driver.py` docstring), ORCA serial throughput, thermal behavior.
+both arms + hands, ORCA serial throughput, thermal behavior, and whether the
+motor CAN watchdog is actually configured on THIS rig's motors (`hw_bringup
+--step watchdog`). Confirmed on metal 2026-06-11: the motor zeros do NOT follow
+i2rt's convention (hang reads j2≈−177°, j6≈+312°) — expected and fine for the
+runtime (chain-level, measured map), but i2rt's OWN tools/examples will reject
+this rig's poses at boot; don't "fix" that by re-zeroing motors without
+re-running the full bring-up.
 
 ## What Is Deliberately NOT Here
 
