@@ -10,15 +10,18 @@ jogging.
     uv run python scripts/jog_arms.py --sink hw          # REAL arms (Linux host)
 
 Keys:
+    UP / DOWN  jog selected joint + / - step    LEFT / RIGHT  select joint
     TAB        switch side (left/right)         1..6   select joint
-    = / -      jog selected joint + / - step    [ / ]  halve / double step
+    = / -      same as UP / DOWN                [ / ]  halve / double step
     w / s      EE forward / back                a / d  EE left / right
     r / f      EE up / down                     h      go home (rest pose)
-    p          print state                      q,ESC  quit
+    p          print state                      m      print MEASURED pose (hw)
+    q,ESC  quit
 """
 from __future__ import annotations
 
 import argparse
+import os
 import select
 import sys
 import termios
@@ -115,10 +118,53 @@ class JogSession:
                 f"{self.ee_step*100:.1f}cm  {qs}")
 
 
+class _Tee:
+    """Hardware first; the render copy + publish are best-effort cosmetics so the
+    dashboard mirrors the jog 1:1 (losing it never blocks the metal)."""
+
+    def __init__(self, hw, render):
+        self.hw = hw
+        self.render = render
+        self.arms = hw.arms                  # wired-side detection keeps working
+
+    def set_arm(self, side, q):
+        self.hw.set_arm(side, q)
+        try:
+            self.render.set_arm(side, q)
+        except Exception:
+            pass
+
+    def set_hand(self, side, joints_deg):
+        self.hw.set_hand(side, joints_deg)
+        try:
+            self.render.set_hand(side, joints_deg)
+        except Exception:
+            pass
+
+    def publish(self, *a, **k):
+        try:
+            self.render.publish(*a, **k)
+        except Exception:
+            pass
+
+    def close(self):
+        self.hw.close()
+        try:
+            self.render.close()
+        except Exception:
+            pass
+
+
 def _make_sink(kind: str, rig: dict):
     if kind == "hw":
         from bimanual_teleop.hardware import HardwareSink
-        return HardwareSink(rig)
+        hw = HardwareSink(rig)
+        try:
+            from bimanual_teleop.render_sink import RenderSink
+            return _Tee(hw, RenderSink(rig))
+        except Exception as e:
+            print(f"[jog] dashboard mirror disabled ({e}) — hardware jog unaffected")
+            return hw
     from bimanual_teleop.render_sink import RenderSink
     return RenderSink(rig)
 
@@ -127,11 +173,23 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--sink", choices=["render", "hw"], default="render",
                     help="render = sim/Unity/dashboard preview; hw = REAL arms (Linux host)")
+    ap.add_argument("--max-deg-s", type=float, default=10.0,
+                    help="hw only: per-joint speed cap for this jog session "
+                         "(default 10°/s — far below hardware.rate_limit; 0 = rig value)")
     args = ap.parse_args()
 
     rig = load_rig()
+    if args.sink == "hw" and args.max_deg_s > 0:
+        rig["hardware"]["rate_limit"] = float(np.radians(args.max_deg_s))
+        print(f"[jog] hw speed cap {args.max_deg_s:.0f}°/s "
+              f"({rig['hardware']['rate_limit']:.3f} rad/s) at the CAN shaper")
     sink = _make_sink(args.sink, rig)
     jog = JogSession(rig, sink)
+    if args.sink == "hw" and jog.side not in getattr(sink, "arms", {}):
+        wired = list(getattr(sink, "arms", {}))
+        if wired:
+            jog.side = wired[0]
+            print(f"[jog] starting on the wired side: {jog.side}")
     print(__doc__.split("Keys:")[1])
     print(f"sink={args.sink}  |  watch on the dashboard: uv run python scripts/dashboard.py")
     print(jog.status_line(), flush=True)
@@ -141,21 +199,79 @@ def main() -> int:
     tty.setcbreak(fd)
     t0 = time.monotonic()
     try:
+        last_meas = 0.0
+        last_key = {"j": 0.0, "e": 0.0}
+
+        def may_move(kind: str) -> bool:
+            # Held keys autorepeat ~30/s but the metal tracks at ~10 deg/s (hw):
+            # admit motion keys only as fast as the hardware can actually follow,
+            # so the commanded target can NEVER run away from the measured pose.
+            if not getattr(sink, "arms", None):
+                return True                       # render-only: no physical cap
+            need = (jog.joint_step / np.radians(10.0) if kind == "j"
+                    else jog.ee_step / 0.05)
+            nowk = time.monotonic()
+            if nowk - last_key[kind] < need:
+                return False
+            last_key[kind] = nowk
+            return True
+
         while True:
             t = time.monotonic() - t0
+            now = time.monotonic()
+            # Re-assert the current target EVERY tick: the hardware shaper is a
+            # tracker and must be called continuously to glide the metal all the
+            # way to the target — a single keypress-time call moves it one
+            # rate-limited step and then parks, silently diverging from the page.
+            for s in getattr(sink, "arms", {}):
+                sink.set_arm(s, jog.ik[s].q)
             jog.publish(60.0, t)
+            if getattr(sink, "arms", None) and now - last_meas > 0.5 and jog.side in sink.arms:
+                meas = np.degrees(sink.arms[jog.side].state())
+                cmd = np.degrees(jog.ik[jog.side].q)
+                gap = float(np.max(np.abs(((meas - cmd) + 180.0) % 360.0 - 180.0)))
+                print(f"\r{jog.status_line()} | meas j{jog.joint + 1}={meas[jog.joint]:+6.1f}° gap={gap:4.1f}°  ",
+                      end="", flush=True)
+                last_meas = now
             if not select.select([sys.stdin], [], [], 1 / 60)[0]:
                 continue
-            ch = sys.stdin.read(1)
-            if ch in ("q", "\x1b"):
+            ch = os.read(fd, 1).decode(errors="ignore")
+            if ch == "\x1b":
+                # Arrow keys arrive as ESC [ A/B/C/D; a BARE esc (nothing pending) quits.
+                # Raw os.read keeps the fd and select() consistent (buffered
+                # sys.stdin.read would swallow the [A and make arrows look like ESC).
+                seq = ""
+                while len(seq) < 2 and select.select([fd], [], [], 0.05)[0]:
+                    seq += os.read(fd, 1).decode(errors="ignore")
+                if seq == "[A":
+                    if not may_move("j"):
+                        continue
+                    jog.step_joint(+1)
+                elif seq == "[B":
+                    if not may_move("j"):
+                        continue
+                    jog.step_joint(-1)
+                elif seq == "[C":
+                    jog.joint = (jog.joint + 1) % 6
+                elif seq == "[D":
+                    jog.joint = (jog.joint - 1) % 6
+                elif not seq:
+                    break
+                else:
+                    continue
+            elif ch == "q":
                 break
             elif ch == "\t":
                 jog.side = "left" if jog.side == "right" else "right"
             elif ch in "123456":
                 jog.joint = int(ch) - 1
             elif ch == "=":
+                if not may_move("j"):
+                    continue
                 jog.step_joint(+1)
             elif ch == "-":
+                if not may_move("j"):
+                    continue
                 jog.step_joint(-1)
             elif ch == "[":
                 jog.joint_step = max(np.radians(0.5), jog.joint_step / 2)
@@ -163,20 +279,24 @@ def main() -> int:
             elif ch == "]":
                 jog.joint_step = min(np.radians(12.0), jog.joint_step * 2)
                 jog.ee_step = min(0.06, jog.ee_step * 2)
-            elif ch == "w":
-                jog.nudge_ee([-jog.ee_step, 0, 0])      # forward = world −X
-            elif ch == "s":
-                jog.nudge_ee([+jog.ee_step, 0, 0])
-            elif ch == "a":
-                jog.nudge_ee([0, -jog.ee_step, 0])      # left = world −Y
-            elif ch == "d":
-                jog.nudge_ee([0, +jog.ee_step, 0])
-            elif ch == "r":
-                jog.nudge_ee([0, 0, +jog.ee_step])
-            elif ch == "f":
-                jog.nudge_ee([0, 0, -jog.ee_step])
+            elif ch in "wsadrf":
+                if not may_move("e"):
+                    continue
+                d = {"w": [-jog.ee_step, 0, 0],         # forward = world −X
+                     "s": [+jog.ee_step, 0, 0],
+                     "a": [0, -jog.ee_step, 0],         # left = world −Y
+                     "d": [0, +jog.ee_step, 0],
+                     "r": [0, 0, +jog.ee_step],
+                     "f": [0, 0, -jog.ee_step]}[ch]
+                jog.nudge_ee(d)
             elif ch == "h":
                 jog.home()
+            elif ch == "m":
+                arms = getattr(sink, "arms", {})
+                if jog.side in arms:
+                    meas = np.degrees(arms[jog.side].state())
+                    print(f"\n[{jog.side}] MEASURED  " +
+                          " ".join(f"j{i+1}={meas[i]:+6.1f}" for i in range(6)))
             elif ch == "p":
                 pass                                     # status prints below anyway
             else:
