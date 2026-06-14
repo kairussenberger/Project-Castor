@@ -130,6 +130,17 @@ class ArmController:
         self.speed_max = float(s.get("target_speed_max", 0.8))        # m/s
         self.accel_max = float(s.get("target_accel_max", 5.0))        # m/s²
         self.jump_speed = float(s.get("target_jump_speed", 3.0))      # m/s → reject
+        # Transport latched once: the per-side teleport rejection below exists to
+        # catch LIVE tracking glitches (58–65 m/s) and re-anchor instead of letting
+        # the arm whip. On a REPLAY tape the stream is deterministic file data, the
+        # ReplayConductor already paces the clock to the metal, and a recorded jump
+        # must NOT silently park the arm (that is the very motion we are replaying).
+        # So widen the reject hugely for transport=='replay' (LIVE byte-for-byte
+        # unchanged). It is not removed outright — a truly absurd value still
+        # re-anchors rather than feeding NaN/inf-speed motion to the governor.
+        self.transport = str(rig.get("vr", {}).get("transport", "fake"))
+        if self.transport == "replay":
+            self.jump_speed = float(s.get("replay_jump_speed", 1e6))
         self.ang_speed_max = float(s.get("target_ang_speed_max", 2.5))  # rad/s
         self.ang_accel_max = float(s.get("target_ang_accel_max", 25.0))  # rad/s²
         # Tracker bandwidths (critically damped: kp = ω², kd = 2ω). Orientation
@@ -311,7 +322,10 @@ class ArmController:
         # motion. Testing the raw wrist — not the mapped target — keeps the
         # engage GLIDE (which legitimately demands ~1.5 m/s of target motion)
         # from ever reading as a jump. On rejection the movement simply does
-        # not happen: re-anchor and glide from the current pose instead.
+        # not happen: re-anchor and glide from the current pose instead. On
+        # transport=='replay' jump_speed was widened to ~1e6 in __init__ so a
+        # recorded glitch replays instead of parking the arm (the conductor paces
+        # it); LIVE keeps the 3.0 m/s reject.
         w_now = np.asarray(hand.wrist, dtype=float)[:3, 3]
         if self._prev_wrist is not None:
             pdt = max(float(t) - self._prev_wrist[1], 1e-6)

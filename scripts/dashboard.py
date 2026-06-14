@@ -189,11 +189,29 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>bimanual-teleo
  header b{font-size:15px;margin-right:8px}
  .chip{padding:4px 12px;border-radius:13px;background:#2a2f38;font-weight:600;font-size:13px}
  .ok{background:#1e5d3a}.bad{background:#7c2d2d}.warn{background:#7a6020}
- main{display:grid;grid-template-columns:minmax(620px,1fr) 350px;gap:14px;padding:14px;max-width:1400px}
+ main{display:grid;grid-template-columns:minmax(900px,1fr) 350px;gap:14px;padding:14px;max-width:1760px}
  .panel{background:var(--panel);border:1px solid #232936;border-radius:12px;padding:10px 12px}
  .duo{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
  .ptitle{font-size:12.5px;font-weight:700;color:#9fb2c8;letter-spacing:.4px;margin:2px 0 6px}
  .ptitle span{color:var(--dim);font-weight:400}
+ /* control-system pipeline: 4 stages L→R with arrow gutters between them */
+ .pipe{display:grid;grid-template-columns:repeat(4,1fr);align-items:start;gap:0}
+ .stage{display:flex;flex-direction:column;min-width:0}
+ .stagehd{display:flex;align-items:center;gap:8px;margin:0 2px 6px}
+ .stagenum{flex:0 0 auto;width:22px;height:22px;border-radius:50%;background:#2b3550;color:#cfe0ff;font-weight:800;font-size:13px;display:flex;align-items:center;justify-content:center}
+ .stagettl{font-size:13px;font-weight:800;color:#cdd9e8;letter-spacing:.3px;line-height:1.1}
+ .stagesub{font-size:11px;color:var(--dim);font-weight:500}
+ .arrow{flex:0 0 auto;align-self:center;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#4b5566;font-size:26px;padding:0 6px;min-width:36px}
+ .arrow.gapcol{min-width:74px;font-size:22px}
+ .gapbars{display:flex;gap:2px;align-items:flex-end;height:34px;margin-top:4px}
+ .gapbars .gb{width:6px;background:#2a3340;border-radius:2px 2px 0 0;min-height:2px}
+ .gaplbl{font-size:9px;color:var(--dim);letter-spacing:.3px;margin-top:3px;text-align:center;font-weight:700}
+ .readout{margin-top:7px;font-size:11.5px;line-height:1.45;font-variant-numeric:tabular-nums;min-height:54px}
+ .readout .row{display:flex;justify-content:space-between;gap:6px;color:var(--dim)}
+ .readout .row b{color:var(--ink);font-weight:600}
+ #panelHW{position:relative}
+ .placeholder{position:absolute;left:10px;right:10px;top:10px;height:360px;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;color:#5a6472;font-weight:800;font-size:15px;letter-spacing:.4px;pointer-events:none;background:rgba(11,14,19,.55);border-radius:8px}
+ .placeholder span{font-weight:500;font-size:11px;color:#454e5b;margin-top:5px}
  canvas{display:block;border-radius:8px;background:#0b0e13;cursor:grab;width:100%}
  h3{margin:2px 0 8px;font-size:14px} .armttl{display:flex;justify-content:space-between;align-items:baseline}
  .gauge{display:grid;grid-template-columns:24px 1fr 62px;gap:8px;align-items:center;margin:3px 0;font-variant-numeric:tabular-nums}
@@ -300,14 +318,47 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>bimanual-teleo
 </div>
 <main>
  <div>
-  <div class=duo>
-   <div class=panel><div class=ptitle>YOUR HANDS <span>— Quest joints, torso-relative</span></div>
-    <canvas id=cvH width=460 height=400></canvas></div>
-   <div class=panel><div class=ptitle>ROBOT <span>— real YAM geometry, live</span></div>
-    <canvas id=cvR width=460 height=400></canvas></div>
+  <div id=replayBanner style="display:none;margin-bottom:12px;padding:10px 14px;border-radius:10px;background:#13233a;border:1px solid #2c4a78;align-items:center;gap:12px">
+   <span id=rbIcon style="font-size:18px">&#9881;</span>
+   <div style="flex:1">
+    <div id=rbMsg style="font-weight:800;font-size:14px;color:#9fc2f4;letter-spacing:.3px"></div>
+    <span style="display:block;margin-top:6px;height:8px;background:#0b1422;border-radius:4px;overflow:hidden">
+     <span id=rbBar style="display:block;height:100%;width:0%;background:#6f9fe8;transition:width .15s"></span>
+    </span>
+   </div>
+   <span id=rbRatio class=meta style="font-weight:700;color:#bcd0e6"></span>
   </div>
-  <div class=panel><div class=ptitle>OVERLAY <span>— your hands mapped into robot world (gold) over the robot. drag = orbit, scroll = zoom</span></div>
-   <canvas id=cvO width=952 height=430></canvas></div>
+  <!-- CONTROL-SYSTEM PIPELINE: operator hands -> mapped EE target -> commanded
+       joints -> (tracking gap) -> measured encoder pose. Four stages L→R, each a
+       3D/visual panel + compact readout, with arrows between them. -->
+  <div class=pipe>
+   <div class=stage>
+    <div class=stagehd><span class=stagenum>1</span><div><div class=stagettl>QUEST INPUT</div><div class=stagesub>hand tracking</div></div></div>
+    <div class=panel><canvas id=cvH width=460 height=360></canvas>
+     <div id=roH class=readout></div></div>
+   </div>
+   <div class=arrow>&#10142;</div>
+   <div class=stage>
+    <div class=stagehd><span class=stagenum>2</span><div><div class=stagettl>MAPPING &rarr; TARGET</div><div class=stagesub>Kai&#39;s retarget</div></div></div>
+    <div class=panel><canvas id=cvM width=460 height=360></canvas>
+     <div id=roM class=readout></div></div>
+   </div>
+   <div class=arrow>&#10142;</div>
+   <div class=stage>
+    <div class=stagehd><span class=stagenum>3</span><div><div class=stagettl>TARGET JOINTS</div><div class=stagesub>commanded q</div></div></div>
+    <div class=panel><canvas id=cvR width=460 height=360></canvas>
+     <div id=roR class=readout></div></div>
+   </div>
+   <div class="arrow gapcol" id=arrGap><span>&#10142;</span><div id=gapBars class=gapbars></div><div class=gaplbl>TRACKING GAP</div></div>
+   <div class=stage>
+    <div class=stagehd><span class=stagenum>4</span><div><div class=stagettl>REAL ROBOT</div><div class=stagesub>encoders</div></div></div>
+    <div class=panel id=panelHW><canvas id=cvHW width=460 height=360></canvas>
+     <div id=hwPlaceholder class=placeholder>no hardware<br><span>run HW REPLAY / HW TELEOP to drive the metal</span></div>
+     <div id=roHW class=readout></div></div>
+   </div>
+  </div>
+  <div class=panel style="margin-top:14px"><div class=ptitle>OVERLAY <span>— your hands mapped into robot world (gold) over the robot. drag = orbit, scroll = zoom</span></div>
+   <canvas id=cvO width=952 height=410></canvas></div>
  </div>
  <div>
   <div class=panel id=cardSafety style="margin-bottom:14px;display:none"></div>
@@ -376,7 +427,9 @@ function setView(yaw,pitch){VIEW.yaw=yaw;VIEW.pitch=pitch;}
 // All panels share VIEW (the GIF camera by default). Hands are drawn in the SAME
 // world axes convention as the robot, so the three panels can never disagree.
 const scH=Scene($('cvH'),430,[-0.28,0,0.10]);
-const scR=Scene($('cvR'),300,[-0.1,-0.05,0.82]);
+const scM=Scene($('cvM'),300,[-0.1,-0.05,0.82]);    // stage 2: mapped EE target over the robot
+const scR=Scene($('cvR'),300,[-0.1,-0.05,0.82]);    // stage 3: robot at COMMANDED joints
+const scHW=Scene($('cvHW'),300,[-0.1,-0.05,0.82]);  // stage 4: robot at MEASURED encoder pose
 const scO=Scene($('cvO'),330,[-0.12,-0.05,0.85]);
 function meshInto(s,cam,T,verts,base,alpha){
  const R=[[T[0],T[1],T[2]],[T[4],T[5],T[6]],[T[8],T[9],T[10]]],t=[T[3],T[7],T[11]];
@@ -433,6 +486,41 @@ function drawHands(st){
  flush(scH);
 }
 function drawRobot(st,meshT,hm,hT){clearCv(scR);const cam=camOf(scR);grid(scR,cam,0);robotInto(scR,cam,st,meshT,null,hm,hT);flush(scR)}
+// Stage 2 — MAPPING → ROBOT TARGET: faint robot ghost + the commanded EE target
+// (arms.{side}.cmd_pos/cmd_quat, world frame) drawn as a bold marker/triad. This
+// is the operator→robot position-mapping output the IK is asked to reach.
+function drawTarget(st,meshT){
+ clearCv(scM);const cam=camOf(scM);grid(scM,cam,0);
+ if(MESH&&MESH.stand)for(const g of MESH.stand)meshInto(scM,cam,EYE16,g,[60,67,80],0.5);
+ for(const side of['left','right']){
+  const a=st.arms?st.arms[side]:null;if(!a)continue;
+  if(MESH&&meshT&&meshT[side]){const Ts=meshT[side],gs=MESH[side];     // faint ghost of where it is now
+   for(let g=0;g<gs.length&&g<Ts.length;g++)meshInto(scM,cam,Ts[g],gs[g],ARM_RGB[side],0.28);}
+  else if(a.link_pos){const Pn=[];for(let i=0;i<a.link_pos.length;i+=3)Pn.push(a.link_pos.slice(i,i+3));
+   for(let i=1;i<Pn.length;i++)seg(scM,cam,Pn[i-1],Pn[i],dim(ARM_RGB[side],1.3),i<4?7:5)}
+  if(a.cmd_pos){                                                       // the COMMANDED target
+   ring(scM,cam,a.cmd_pos,[65,217,141],9);dot(scM,cam,a.cmd_pos,[65,217,141],3.2);
+   if(a.cmd_quat){const C=quat2cols(a.cmd_quat),L=0.10;
+    for(let k=0;k<3;k++)seg(scM,cam,a.cmd_pos,[a.cmd_pos[0]+C[k][0]*L,a.cmd_pos[1]+C[k][1]*L,a.cmd_pos[2]+C[k][2]*L],TRIAD[k],2.6)}
+   if(a.ee_pos)seg(scM,cam,a.ee_pos,a.cmd_pos,[65,217,141],1.6);}       // achieved → target tie-line
+  if(a.ee_pos)dot(scM,cam,a.ee_pos,[200,200,200],3);
+ }
+ flush(scM);
+}
+// Stage 4 — REAL ROBOT (encoders): the SAME YAM meshes FK'd at the MEASURED pose
+// (status.hw.arms.{side}.measured → /state mesh_T_hw). Muted colours so it reads
+// as "metal", and NO commanded ring (that lives in stage 2/3) — this is ground
+// truth from the encoders, what the arm IS, not what it was told to do.
+const HW_RGB={left:[120,150,196],right:[196,128,84]};
+function drawRobotHW(st,meshHW){
+ clearCv(scHW);const cam=camOf(scHW);grid(scHW,cam,0);
+ if(MESH&&MESH.stand)for(const g of MESH.stand)meshInto(scHW,cam,EYE16,g,[78,88,100],null);
+ for(const side of['left','right']){
+  const Ts=meshHW?meshHW[side]:null,gs=MESH?MESH[side]:null;
+  if(MESH&&Ts&&gs)for(let g=0;g<gs.length&&g<Ts.length;g++)meshInto(scHW,cam,Ts[g],gs[g],HW_RGB[side],null);
+ }
+ flush(scHW);
+}
 function drawOverlay(st,meshT,hm,hT){
  clearCv(scO);const cam=camOf(scO);grid(scO,cam,0);
  const bases=robotInto(scO,cam,st,meshT,0.85,hm,hT);
@@ -453,6 +541,86 @@ function drawOverlay(st,meshT,hm,hT){
    else dot(scO,cam,o,GOLD,4.5);
   }}
  flush(scO);
+}
+// ---- pipeline compact readouts + gap/convergence indicators ----
+function ro(rows){return rows.filter(Boolean).map(([k,v,c])=>
+ '<div class=row><span>'+k+'</span><b'+(c?' style="color:'+c+'"':'')+'>'+v+'</b></div>').join('')}
+function updPipeline(st,d){
+ const arms=st.arms||{};
+ // Stage 1 — QUEST INPUT: per-side tracked + torso→wrist vector magnitude.
+ const oh=(st.op&&st.op.hands)||{};
+ $('roH').innerHTML=ro([['left',(oh.left&&oh.left.tracked)?'tracked':'—',(oh.left&&oh.left.tracked)?'#6f9fe8':'#76808d'],
+  ['right',(oh.right&&oh.right.tracked)?'tracked':'—',(oh.right&&oh.right.tracked)?'#e8854a':'#76808d']]);
+ // Stage 2 — MAPPING → ROBOT TARGET: commanded EE + workspace-clamp warning.
+ const m2=[];
+ for(const side of['left','right']){const a=arms[side];if(!a)continue;
+  if(a.cmd_pos)m2.push(['cmd '+side[0].toUpperCase(),a.cmd_pos.map(v=>v.toFixed(2)).join(', ')+' m']);
+  if(a.clamp_dist!=null&&a.clamp_dist>0.005)
+   m2.push(['WS CLAMP '+side[0].toUpperCase(),(a.clamp_dist*100).toFixed(1)+' cm',a.clamp_dist>0.02?'#ff8a8a':'#e8b339']);}
+ $('roM').innerHTML=m2.length?ro(m2):'<div class=row><span>commanded EE</span><b>—</b></div>';
+ // Stage 3 — TARGET ROBOT JOINTS: commanded q (deg), worst limit margin.
+ const m3=[];
+ for(const side of['left','right']){const a=arms[side];if(!a||!a.q)continue;
+  const worst=a.margins?Math.min(...a.margins):1;
+  m3.push(['q '+side[0].toUpperCase()+' (j1)',(a.q[0]*57.2958).toFixed(0)+'°',worst<0.12?'#ff8a8a':null]);}
+ $('roR').innerHTML=m3.length?ro(m3):'<div class=row><span>commanded q</span><b>—</b></div>';
+ // Stage 4 — REAL ROBOT + the TRACKING GAP between commanded & measured.
+ updGapAndHW(st,d);
+}
+// Between stage 3 and 4: per-joint convergence error (gap / gap_max) as small bars,
+// and the stage-4 readout / placeholder, all from status.hw (DEFENSIVE: absent on
+// sim → muted placeholder, no throw).
+// Per-joint tracking ceiling (rig safety.runtime.max_tracking_error): hardware
+// telemetry sends limits.track as a PER-JOINT list ([0.6,0.6,0.6,1.4,3.0,3.0]) —
+// dividing a scalar gap by the whole array yields NaN and silently kills the
+// warning colours, so always pick the ceiling for THAT joint (0-based j).
+function trackOf(lim,j){const t=lim&&lim.track;return Array.isArray(t)?(t[j]!=null?t[j]:0.35):(t!=null?t:0.35);}
+function updGapAndHW(st,d){
+ const hw=(st.status&&st.status.hw)||null;
+ const ph=$('hwPlaceholder'),roHW=$('roHW'),gapWrap=$('arrGap'),gb=$('gapBars');
+ const haveHW=!!(d&&d.mesh_T_hw&&(d.mesh_T_hw.left||d.mesh_T_hw.right));
+ ph.style.display=haveHW?'none':'';
+ if(!hw){gapWrap.style.opacity=0.3;gb.innerHTML='';roHW.innerHTML='';return}
+ gapWrap.style.opacity=1;
+ // gap bars: prefer the RIGHT arm (the wired/driven side); fall back to left.
+ const arms=hw.arms||{},side=arms.right?'right':(arms.left?'left':null),a=side?arms[side]:null;
+ const lim=hw.limits||{},wf=lim.warn_frac||0.8;
+ if(a&&a.gap){let bars='';for(let i=0;i<a.gap.length;i++){
+   const r=Math.max(0,Math.min(1.25,a.gap[i]/trackOf(lim,i))),hpx=Math.max(2,r*34);
+   const col=r>1?'#ff8a8a':r>wf?'#e8b339':'#41d98d';
+   bars+='<span class=gb title="j'+(i+1)+' '+(a.gap[i]*57.2958).toFixed(1)+'°" style="height:'+hpx.toFixed(0)+'px;background:'+col+'"></span>';}
+  gb.innerHTML=bars;}
+ else gb.innerHTML='';
+ const m4=[];
+ if(a&&a.gap_max!=null){const p=100*a.gap_max/trackOf(lim,(a.gap_joint||1)-1);
+  m4.push(['gap (worst)',(a.gap_max*57.2958).toFixed(1)+'° j'+(a.gap_joint||'?'),p>100?'#ff8a8a':p>100*wf?'#e8b339':'#41d98d']);}
+ if(a&&a.temp_max!=null)m4.push(['temp',a.temp_max.toFixed(0)+'°C']);
+ if(!haveHW)m4.push(['encoders','no hardware','#76808d']);
+ roHW.innerHTML=m4.length?ro(m4):'';
+}
+// CONVERGENCE / PLAYBACK banner — driven by the OPTIONAL status.hw.replay field
+// (additive; sim runs without it never show the banner). Contract consumed:
+//   replay = {phase:"converge"|"follow", scale:0..1, ratio, converged, timed_out}
+// converge = arm auto-calibrating to the tape's start pose; follow = tracking the
+// tape at `scale` of full speed. Every field read defensively.
+function updReplayBanner(st){
+ const hw=(st.status&&st.status.hw)||null;
+ const rp=hw&&hw.replay?hw.replay:null;
+ const bn=$('replayBanner');
+ if(!rp){bn.style.display='none';return}
+ bn.style.display='flex';
+ const phase=rp.phase||'',scale=typeof rp.scale==='number'?rp.scale:0;
+ const ratio=typeof rp.ratio==='number'?rp.ratio:(typeof rp.scale==='number'?rp.scale:0);
+ const conv=phase==='converge';
+ $('rbIcon').innerHTML=conv?'&#129517;':(rp.converged?'&#9654;':'&#9881;');
+ $('rbMsg').textContent=conv
+  ?('AUTO-CALIBRATING TO START'+(rp.timed_out?' — TIMED OUT (holding)':''))
+  :('FOLLOWING x'+Math.round(scale*100)+'%'+(rp.converged?'':' (settling)'));
+ $('rbMsg').style.color=rp.timed_out?'#ff9a9a':conv?'#f4d97a':'#9fc2f4';
+ const pct=Math.max(0,Math.min(100,(conv?ratio:scale)*100));
+ $('rbBar').style.width=pct.toFixed(0)+'%';
+ $('rbBar').style.background=rp.timed_out?'#ff8a8a':conv?'#d4af37':'#6f9fe8';
+ $('rbRatio').textContent=conv?(Math.round(pct)+'% to start'):('scale '+scale.toFixed(2));
 }
 function gaugeRow(i,q,lo,hi,margin){
  const span=hi-lo||1,pos=Math.max(0,Math.min(1,(q-lo)/span));
@@ -573,7 +741,7 @@ function updSafety(st){
  h+='<div class=kv><span>shaper rate (clamped)</span><b>'+(hw.eff_rate!=null?hw.eff_rate+' rad/s':'—')+'</b></div>';
  for(const side of(hw.sides||[])){const a=(hw.arms||{})[side];if(!a)continue;
   h+='<div style="margin-top:9px;font-weight:700;color:#9fb2c8;font-size:12px">'+side.toUpperCase()+' arm</div>';
-  if(a.gap_max!=null){const p=100*a.gap_max/(lim.track||0.35);
+  if(a.gap_max!=null){const p=100*a.gap_max/trackOf(lim,(a.gap_joint||1)-1);
    h+='<div class=kv><span>tracking gap</span><b style="color:'+(p>100?'#ff8a8a':p>100*wf?'#e8b339':'#41d98d')+'">'+(a.gap_max*57.2958).toFixed(1)+'° (j'+a.gap_joint+')</b></div>'+bar01(p,p>100*wf?'#ff8a8a':'#41d98d')}
   if(a.temp_max!=null){const p=100*a.temp_max/(lim.temp||75);
    h+='<div class=kv><span>motor temp</span><b style="color:'+(p>100?'#ff8a8a':p>100*wf?'#e8b339':'#9fb2c8')+'">'+a.temp_max.toFixed(0)+'°C</b></div>'+bar01(p,p>100*wf?'#ff8a8a':'#e8b339')}
@@ -659,7 +827,13 @@ async function tick(){
    else wc.style.display='none';
    updCalib(s);
    if(ctrlN%6===0)updSafety(s);          // telemetry panel: 8 Hz, not every frame
-   drawHands(s);drawRobot(s,d.mesh_T,d.hand_mesh,d.hand_T);drawOverlay(s,d.mesh_T,d.hand_mesh,d.hand_T);
+   drawHands(s);                                   // stage 1: Quest hands
+   drawTarget(s,d.mesh_T);                          // stage 2: mapped EE target over robot
+   drawRobot(s,d.mesh_T,d.hand_mesh,d.hand_T);      // stage 3: robot at COMMANDED joints
+   drawRobotHW(s,d.mesh_T_hw);                      // stage 4: robot at MEASURED encoder pose
+   updPipeline(s,d);                                // per-stage readouts + tracking-gap bars
+   updReplayBanner(s);                              // convergence/playback banner (optional hw.replay)
+   drawOverlay(s,d.mesh_T,d.hand_mesh,d.hand_T);
    $('cardL').innerHTML=card('left',s);$('cardR').innerHTML=card('right',s);
   }
   // status + engine-log polls are SLOW (pgrep/subprocess, file read) — fire them
@@ -1126,6 +1300,23 @@ def make_server(feed: StateFeed, host: str, port: int, rig: dict | None = None,
                             snap["hand_T"] = meshes.hand_transforms(snap["state"])
                         else:
                             snap["hand_mesh"] = meshes.hand_world(snap["state"])
+                        # Pipeline stage 4 (REAL ROBOT): FK the same YAM meshes at the
+                        # MEASURED encoder pose so the dashboard can draw the metal's
+                        # actual joints next to the commanded ones. Only when run_hw is
+                        # publishing runtime telemetry (status.hw); absent on the
+                        # sim/render path, so stage 4 shows a "no hardware" placeholder.
+                        # measured[6] is MODEL-space (HardwareSink maps motor→model
+                        # before telemetry), so it feeds meshes.transforms() unchanged —
+                        # the exact same FK that stage 3 uses for the commanded q.
+                        hw = ((snap["state"].get("status") or {}).get("hw")) or None
+                        if hw:
+                            hw_arms = {}
+                            for side, rec in (hw.get("arms") or {}).items():
+                                meas = (rec or {}).get("measured")
+                                if meas:
+                                    hw_arms[side] = {"q": list(meas)}
+                            if hw_arms:
+                                snap["mesh_T_hw"] = meshes.transforms(hw_arms)
                     except Exception:
                         snap["mesh_T"] = {}
                 body = json.dumps(snap).encode()

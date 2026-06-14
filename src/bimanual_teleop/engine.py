@@ -80,6 +80,14 @@ class TeleopEngine:
         # the applied fit silently wrong. Constructed BEFORE the auto-load below
         # (_apply_calibration resets it).
         self.guard = AnchorGuard(rig)
+        # Replay is deterministic file data, NOT a live anchor-moving headset: the
+        # AnchorGuard JUMP channel (a recorded reach reads as a "teleport") must not
+        # lock follow on a tape — the ReplayConductor already paces the clock and
+        # the per-side teleport reject is widened for replay. We therefore run the
+        # guard DISARMED on replay so it still tracks continuity (and emits holds /
+        # status) but never trips/locks follow. Orbit/vuer stay fully armed.
+        self._guard_armed_transport = (rig.get("vr", {}).get("transport", "fake")
+                                       not in ("replay",))
         self._calib_file = self._resolve_calib_path(rig)
         self._req_calib = False                    # set from the control-server thread,
         self._req_calib_cancel = False             # consumed by tick() on the control loop
@@ -173,7 +181,10 @@ class TeleopEngine:
                                               for h in (frame.hands or {}).values()))
         # Armed whenever a trip would protect something: arms following, or a
         # capture in flight (poses straddling an anchor change must not be fit).
-        armed = (not self.follow_locked) or self.neutral.active
+        # On replay the JUMP channel is disarmed (deterministic tape, conductor-
+        # paced) so a recorded reach never locks follow — consistent with how the
+        # blackout channel is already disarmed for non-live transports.
+        armed = self._guard_armed_transport and ((not self.follow_locked) or self.neutral.active)
         holds = self.guard.observe(wb, fresh, t, armed=armed)
         if self.guard.take_trip():
             reason = self.guard.trip_reason or "tracking anchor changed"

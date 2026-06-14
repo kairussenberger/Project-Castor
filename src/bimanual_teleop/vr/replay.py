@@ -99,6 +99,12 @@ class ReplaySource:
                  speed: float = 1.0):
         self.loop = bool(loop)
         self.speed = max(1e-3, float(speed))   # 0.2 = play 5x slower than recorded
+        # External clock governor (hardware replay): the replay clock advances by
+        # speed * _rate_scale * dt_wall each latest(). _rate_scale defaults to 1.0
+        # so run_teleop/sim replay and the verify_stack record/replay smoke are
+        # byte-for-byte unchanged; the ReplayConductor drives it to 0..1 on the
+        # hardware path so the tape never outruns the metal (see safety/replay_drive).
+        self._rate_scale = 1.0
         d = data if data is not None else dict(np.load(path, allow_pickle=False))
         self.t = np.asarray(d["t"], float)
         self.head = np.asarray(d["head"], float)
@@ -116,7 +122,13 @@ class ReplaySource:
                           "pinch": np.asarray(d[f"{s}_pinch"], float),
                           "landmarks": np.asarray(d[f"{s}_landmarks"], float)} for s in SIDES}
         self._t0_wall: float | None = None
-        self._last_replay_t = float(self.t[0]) if len(self.t) else 0.0
+        self._prev_now: float | None = None       # wall clock of the previous latest()
+        self._seen_t0_wall: float | None = None    # _t0_wall observed last latest() (re-anchor on change)
+        # The replay CLOCK (recorded-time seconds). Advanced incrementally so an
+        # external governor can scale or freeze it; clamped into the recording span
+        # (or wrapped when looping) by _index/frame_at.
+        self._clock = float(self.t[0]) if len(self.t) else 0.0
+        self._last_replay_t = self._clock
 
     @classmethod
     def from_recorder(cls, rec: SessionRecorder, **kw) -> "ReplaySource":
@@ -167,6 +179,41 @@ class ReplaySource:
     def current_engaged(self) -> dict[str, bool]:
         return self.engaged_at(self._last_replay_t)
 
+    # --- external clock governor (hardware replay) --------------------------- #
+    def set_rate_scale(self, s: float) -> None:
+        """Scale how fast the replay clock advances each latest(), clamped to
+        [0, 1]. 1.0 is the default (unchanged behaviour); 0.0 freezes the clock.
+        The ReplayConductor sets this from the live tracking error so the tape
+        never outruns the gravity-loaded arm."""
+        self._rate_scale = float(np.clip(float(s), 0.0, 1.0))
+
+    def hold(self) -> None:
+        """Freeze the replay clock (rate scale 0) — convenience for the conductor's
+        converge phase."""
+        self._rate_scale = 0.0
+
+    def set_clock(self, t: float) -> None:
+        """Jump the replay clock to recorded time t (clamped into the span by the
+        sampler). Used to position the tape at the first engaged frame before the
+        hardware loop starts following."""
+        self._clock = float(t)
+        self._last_replay_t = self._clock
+
+    def first_engaged_time(self, sides=None) -> float | None:
+        """Recorded time of the first frame whose engaged flag is True for ANY of
+        `sides` (default: all SIDES), reading self.engaged_arr in SIDES order.
+        None if no frame ever engages — the caller then starts at the recording
+        start. This lets the loop skip a long idle pre-roll straight to motion."""
+        if len(self.t) == 0 or self.engaged_arr.size == 0:
+            return None
+        sides = SIDES if sides is None else tuple(sides)
+        cols = [k for k, s in enumerate(SIDES) if s in sides]
+        if not cols:
+            return None
+        any_eng = self.engaged_arr[:, cols].any(axis=1)
+        idx = np.flatnonzero(any_eng)
+        return float(self.t[int(idx[0])]) if idx.size else None
+
     def latest(self) -> VRFrame | None:
         if len(self.t) == 0:
             return None
@@ -174,7 +221,29 @@ class ReplaySource:
             self._last_replay_t = float(self.t[0])
             return self.frame_at(self._last_replay_t)
         now = time.monotonic()
-        self._last_replay_t = float(self.t[0] + self.speed * (now - self._t0_wall))
+        # A caller that re-anchors _t0_wall between ticks (fast-forward / rewind by
+        # hand) re-bases the clock to that origin: clock = t[0] + speed*(now - t0).
+        # This keeps the old absolute semantics for that idiom while the normal
+        # path runs incrementally.
+        if self._t0_wall != self._seen_t0_wall:
+            self._seen_t0_wall = self._t0_wall
+            self._prev_now = None
+            self._clock = float(self.t[0])
+        # INCREMENTAL, externally-scaled clock: advance by speed*_rate_scale*dt_wall
+        # since the previous latest(), so a governor can freeze/slow it tick-by-tick.
+        # _rate_scale defaults to 1.0 → equivalent to the old speed*(now-t0) advance
+        # (verified by the round-trip + staleness tests). The FIRST latest() after a
+        # (re-)anchor references _t0_wall (not the previous tick), so a caller that
+        # winds _t0_wall back in time still sees the full elapsed offset.
+        prev = self._prev_now if self._prev_now is not None else self._t0_wall
+        dt_wall = max(0.0, now - prev)
+        self._prev_now = now
+        self._clock += self.speed * self._rate_scale * dt_wall
+        # Clamp into the recording span (looping is handled in _index/frame_at; for
+        # a non-looping tape the clock saturates at the last sample like before).
+        if not self.loop and self.duration > 0:
+            self._clock = min(self._clock, float(self.t[-1]))
+        self._last_replay_t = float(self._clock)
         f = self.frame_at(self._last_replay_t)
         # The recorded timestamp drives deterministic sample selection, but live
         # supervisors compare frame.stamp to the current monotonic clock for
@@ -185,6 +254,11 @@ class ReplaySource:
 
     def start(self) -> None:
         self._t0_wall = time.monotonic()
+        self._seen_t0_wall = self._t0_wall
+        self._prev_now = None                     # first latest() references _t0_wall
+        self._clock = float(self.t[0]) if len(self.t) else 0.0
 
     def stop(self) -> None:
         self._t0_wall = None
+        self._seen_t0_wall = None
+        self._prev_now = None

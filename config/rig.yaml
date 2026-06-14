@@ -244,6 +244,26 @@ safety:
     min: [-0.6, -0.85, -0.6]   # y-min lowered: arms-down home wrist sits at base-y≈-0.56;
     max: [0.6, 0.7, 0.6]       # old -0.2 clipped it +0.36m on engage -> arms curled to center
 
+# HARDWARE REPLAY governor (safety/replay_drive.py @ run_hw --vr replay). A
+# recording is a stream of ABSOLUTE IK targets; played at the tape's own rate they
+# outrun the gravity-loaded, speed-derated, shaped arm, the RuntimeGuard TRACKING
+# gap (safety.runtime.max_tracking_error) opens past its ceiling, and the run dies.
+# The ReplayConductor closes the loop: it FREEZES the replay clock at the
+# trajectory start and lets the arm glide onto it (converge), then advances the
+# clock only as fast as the metal tracks. The clock RATE SCALE is driven by the
+# worst per-joint tracking RATIO (gap[j]/max_tracking_error[j] — the same quantity
+# the guard trips on): full rate at/below soft_frac, ramping linearly to a frozen
+# clock at hard_frac, so the gap is held WELL under 1.0 and the trip is never
+# reached by lag alone. A genuine trip is caught, the shapers reseed from the
+# measured pose, and playback re-converges (it never aborts). Affects ONLY
+# run_hw --vr replay; live teleop and sim/run_teleop replay are untouched.
+replay:
+  converge_tol: 0.10        # rad — worst-joint command↔measured gap that counts as "on the start pose"
+  converge_hold_s: 0.4      # s — the gap must stay within converge_tol this long before following begins
+  converge_timeout_s: 20.0  # s — never converged by now: follow anyway, flagged converge_timed_out (do NOT abort)
+  soft_frac: 0.5            # ratio at/below which the tape plays at full rate (scale 1)
+  hard_frac: 0.85           # ratio at/above which the clock is frozen (scale 0); ramps linearly between
+
 # Hardware-boundary safety (run_hw / HardwareSink). These act ON TOP of the IK
 # velocity limits and joint hardstops — the shaper is the last line of defense:
 # every CAN command is limit-clamped, speed-capped, and PD-smoothed, gliding from

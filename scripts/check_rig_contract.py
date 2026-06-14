@@ -154,9 +154,19 @@ def main() -> int:
             "hardware.sides must be a non-empty subset of left/right — the arms actually wired")
     require(isinstance(hw.get("use_hands"), bool),
             "hardware.use_hands must be an explicit bool (RealHand MOVES the hand at connect)")
-    tol = float(hw.get("engage_pose_tol", float("nan")))
-    require(np.isfinite(tol) and 0.0 < tol <= 0.35,
-            "hardware.engage_pose_tol must be in (0, 0.35] rad — the rest-pose gate must stay meaningful")
+    # engage_pose_tol is scalar OR per-joint (the rig went per-joint so the limp
+    # wrist's free drift doesn't reject every start): the shoulder/elbow (j1–j4)
+    # must stay TIGHT (≤ 0.35 rad) for the rest-pose gate to catch a wrong-arm /
+    # not-at-rest start, while the wrist (j5/j6) is intentionally loose but must
+    # stay < π so a ±π wrong-arm flip still trips.
+    tol = np.atleast_1d(np.asarray(hw.get("engage_pose_tol", float("nan")), dtype=float))
+    require(bool(np.all(np.isfinite(tol))) and bool(np.all(tol > 0.0)),
+            "hardware.engage_pose_tol entries must be finite and > 0 rad")
+    shoulder = tol[:4] if tol.size > 1 else tol
+    require(bool(np.all(shoulder <= 0.35)),
+            "hardware.engage_pose_tol shoulder/elbow (j1–j4) must be ≤ 0.35 rad — the rest-pose gate must stay meaningful")
+    require(bool(np.all(tol <= np.pi)),
+            "hardware.engage_pose_tol must stay < π so a ±π wrong-arm flip still trips the rest-pose gate")
     require(str(hw.get("joint_map_file", "")).endswith(".json"),
             "hardware.joint_map_file must point at the per-machine motor↔model calibration json")
 

@@ -176,9 +176,38 @@ class HardwareSink:
             except Exception:
                 pass
 
+    def recover(self) -> None:
+        """Re-seat the command pipeline on a freshly MEASURED pose after a GENUINE
+        runtime trip — the replay path catches the GuardTrip, calls this, and
+        continues instead of dying. Each active arm's shaper is reset to where the
+        metal ACTUALLY is now (shaper.reset(measured, t)) so the next command glides
+        from the recovered pose with zero velocity (no snap back to the pre-trip
+        command that opened the gap), and the guard's latched trip + tracking
+        debounce are cleared. A telemetry read that fails reseeds from the last
+        commanded pose as a fallback — better a slightly stale seed than no recovery.
+        This NEVER disables the guard: it re-arms it, clean."""
+        now = time.monotonic()
+        for s in self.sides:
+            arm = self.arms.get(s)
+            if arm is None:
+                continue
+            try:
+                pos, _vel, _eff, _temp = arm.chain.read()
+                measured = arm.map.to_model(np.asarray(pos, dtype=float)[:6])
+            except Exception as e:
+                log.debug("%s: recover() telemetry read failed (%s) — reseeding from shaper q", s, e)
+                measured = self.shapers[s].q
+            self.shapers[s].reset(measured, now)
+        if self.guard is not None:
+            self.guard.reset()
+        log.info("recover(): shapers reseeded from measured pose, guard re-armed")
+
     def telemetry(self) -> dict:
         """Snapshot of guard state + per-arm measured/commanded/gap/temp/effort for
-        the dashboard. Cheap; safe to call from the publish path."""
+        the dashboard. Cheap; safe to call from the publish path. EVERYTHING here is
+        JSON-NATIVE (no np.ndarray / np.float): this rides status.hw through
+        json.dumps on the TCP dashboard path, and a stray array would raise there —
+        max_track is the per-joint tracking ceiling, listified for that reason."""
         g = self.guard
         out: dict = {
             "enabled": bool(g.enabled) if g else False,
@@ -186,8 +215,9 @@ class HardwareSink:
             "sides": list(self.sides),
             "eff_rate": round(float(self._eff_rate), 3),
             "hard_max_joint_speed": self._hard_max,
-            "limits": ({"track": g.max_track, "temp": g.max_temp,
-                        "current": g.max_curr, "warn_frac": g.warn_frac} if g else {}),
+            "limits": ({"track": [float(x) for x in np.asarray(g.max_track).reshape(-1)],
+                        "temp": float(g.max_temp), "current": float(g.max_curr),
+                        "warn_frac": float(g.warn_frac)} if g else {}),
             "arms": {},
         }
         if g:
