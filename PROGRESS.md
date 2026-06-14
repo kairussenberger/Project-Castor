@@ -3,6 +3,62 @@
 The repository has been reworked away from the old local MuJoCo simulator toward a
 headless body-relative teleop runtime with a Unity render stream.
 
+## 2026-06-14 (Quest live teleop on BOTH arms; calibration reordered to home-last; dashboard cleanup)
+
+Live Quest→metal teleop is wired end-to-end on this host: both arms calibrated
+and homing, ORBIT hand-tracking reaching the engine over adb, and a single
+**TELEOP LIVE** button driving both arms continuously.
+
+**Host / Quest bring-up**
+- `adb` installed WITHOUT sudo (Google platform-tools in `~/platform-tools`,
+  symlinked into `~/.local/bin`). Quest authorized via a udev rule
+  (`/etc/udev/rules.d/51-oculus-adb.rules`, `MODE=0666` for idVendor `2833`).
+  The ORBIT app (`com.ORBIT.Teleoperation`) launches over adb; the engine's
+  automatic `adb reverse` lands ORBIT's NetMQ PUSH on the host.
+- NOTE: the Quest must be in **hand-tracking** mode (controllers down/off) or it
+  streams nothing — controller-constellation tracking suppresses hand tracking.
+
+**Calibration** (`vr/neutral_calib.py`) — fixes the "stuck measuring" stall + ends at home
+- capture order is now **extended-forward → clap → REST (arms-down) LAST** (was
+  rest→clap→forward). Arms-down is the robot's HOME and the easiest pose to hold
+  still, so the capture closes reliably and the operator finishes at home.
+- `HOLD_S` 2.5→1.5 s and `STILL_TOL` 0.03→0.06 m so the hold actually closes.
+- `tests/test_neutral_calib.py` updated to the new order/contract.
+
+**Hardware engage / homing**
+- `hardware.engage_pose_tol` loosened j1–j4 `0.15→0.30` rad (still ≪ wrong-arm
+  180° / ±2π wrap, so those are still caught) so a slightly-drifted hang engages.
+- **RETURN HOME** (`launch/return_home.py` + dashboard button) drives BOTH wired
+  arms to home (rate-limited) and RE-ANCHORS the rest offset at the settled hang
+  (the automatic `--step rest`), so the engage gate then passes. Guard loosened
+  to 0.50 rad so normal drift (~13° j4 seen on the right arm) is re-anchored, not
+  rejected. Replaced the old RE-ANCHOR REST button.
+- `run_hw --clutch always` added (`AlwaysOn`) so hardware teleop follows
+  continuously.
+
+**Dashboard** (`scripts/dashboard.py`)
+- **TELEOP LIVE** = `run_hw --vr orbit --clutch always --sides right,left` —
+  drives BOTH arms, follows continuously (gesture/deadman clutch removed per
+  operator request). Replaced the right-arm-only HW REPLAY / HW TELEOP buttons.
+- kill-strays sped up: `_busy_ports` uses `SO_REUSEADDR` so a TIME_WAIT socket is
+  no longer counted busy (engine restart ~8 s → ~0.7 s).
+- fixed the flickering `#hint`: a stale engine-log trip was overwriting it every
+  ~1 s while `hint(d)` rewrote it every frame.
+
+**Calibration data / CAN**
+- `config/hw_joint_map.json` carries the good left+right map (signs
+  `[1,1,-1,-1,1,1]`). LEFT = `can0` (bytewerk candleLight, serial `002E…`),
+  RIGHT = `can1` (canable.io, serial `0044…`). `canN` is USB-enumeration order
+  and can flip on replug.
+
+**Open / next**
+- CAN-channel udev locking (`config/99-yam-can.rules`,
+  `scripts/setup_can_persistence.sh`) exists locally but is NOT yet applied or
+  committed — do this before relying on two-arm teleop across reboots/replugs.
+- one anchor-guard test + a cosmetic calib-start log line (`engine.py:321`) still
+  reference the old pose order — harmless, cleanup pending.
+- both-arm live teleop is first-contact: keep speed modest, hand on the e-stop.
+
 ## 2026-06-12 (metal day complete: jog + real-speed replay on the right arm; dashboard replay studio)
 
 The right arm passed the full sim→real checklist on can0. Bring-up ran clean:

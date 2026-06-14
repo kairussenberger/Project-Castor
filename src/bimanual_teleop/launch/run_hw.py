@@ -26,7 +26,7 @@ import numpy as np
 from ..config import load_rig
 from ..engine import TeleopEngine
 from ..hardware import active_sides
-from ..safety.clutch import GestureClutch, RecordedClutch
+from ..safety.clutch import AlwaysOn, GestureClutch, RecordedClutch
 from ..safety.replay_drive import ReplayConductor
 from ..safety.runtime_guard import GuardTrip, effective_rate_limit
 from ..safety.supervisor import Supervisor
@@ -72,8 +72,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--vr", choices=["vuer", "orbit", "fake", "replay"], default="orbit")
     ap.add_argument("replay_path", nargs="?", help="session .npz when --vr replay")
-    ap.add_argument("--clutch", choices=["gesture", "recorded"], default="gesture",
-                    help="hardware engage policy (default: gesture; recorded is for replay sessions)")
+    ap.add_argument("--clutch", choices=["always", "gesture", "recorded"], default="gesture",
+                    help="hardware engage policy (always: follow continuously whenever tracked; "
+                         "gesture: deadman pinch; recorded: replay's own decisions)")
     ap.add_argument("--record", metavar="PATH", default=None,
                     help="write VR frames + engage state to a replayable .npz session")
     ap.add_argument("--hz", type=float, default=None, help="override control rate")
@@ -140,7 +141,12 @@ def main() -> int:
     elif args.vr == "replay":
         print("[hw] replay: recording has NO embedded calibration — replaying through "
               "IDENTITY (old tape / synthetic fixture); targets may be off")
-    clutch = RecordedClutch(src) if args.clutch == "recorded" else GestureClutch()
+    if args.clutch == "recorded":
+        clutch = RecordedClutch(src)
+    elif args.clutch == "always":
+        clutch = AlwaysOn()
+    else:
+        clutch = GestureClutch()
 
     from ..hardware import HardwareSink
     sink = HardwareSink(rig)

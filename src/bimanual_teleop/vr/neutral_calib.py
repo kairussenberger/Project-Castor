@@ -11,19 +11,19 @@ the robot's chest→wrist vector. Two things break a naive fit of that map:
      refuses or fits garbage). There is no in-data absolute reference: the hand
      keypoints share the same anchor as the wrist stream.
 
-The guided THREE-POSE capture solves both at once (captured rest → clap →
-extended-forward; the fit itself is order-free, A/B/C below name the ROLES):
+The guided THREE-POSE capture solves both at once (captured extended-forward →
+clap → rest; the fit itself is order-free, A/B/C below name the ROLES):
 
-    pose 1 (B) — relax both arms down at your sides, hold ~2.5 s
+    pose 1 (A) — extend both arms straight forward at shoulder height, hold ~2.5 s
     pose 2 (C) — press your palms together in front of your chest, hold ~2.5 s
              (anchors the LATERAL map at contact width: YOUR clap maps to the
              ROBOT's hands touching, by construction, and your true midline
              is measured where your palms meet)
-    pose 3 (A) — extend both arms straight forward at shoulder height, hold ~2.5 s
-             (LAST on purpose: pose A maps onto the robot's neutral by
-             construction, so the fit completes while you are ALREADY HOLDING
-             that correspondence — the arms engage and glide to the natural
-             forward neutral, instead of engaging mid-clap at the chest)
+    pose 3 (B) — relax both arms DOWN at your sides, hold ~2.5 s
+             (LAST on purpose: arms-down IS the robot's HOME pose AND the easiest
+             pose to hold dead-still, so the capture closes reliably; the fit
+             completes while you are already at home — relax and the robot glides
+             to its arms-down home, instead of ending mid-air)
 
 Everything the fit needs comes out anchor-proof and head-yaw-proof:
   - the operator's FORWARD direction = the horizontal direction of the A−B
@@ -55,9 +55,9 @@ from ..config import SIDES
 from .frames import lateral_curve
 
 # Capture gates.
-HOLD_S = 2.5          # continuous still time to accept each pose
+HOLD_S = 1.5          # continuous still time per pose (shortened from 2.5 — far fewer "measuring" stalls)
 WINDOW_S = 0.6        # rolling stillness window
-STILL_TOL = 0.030     # m — std-norm of wrist_body over the window
+STILL_TOL = 0.06      # m — std-norm of wrist_body over the window (loosened 0.03→0.06 so the hold reliably closes despite arm tremor)
 SPREAD_MIN = 0.20     # m — pose-A lateral wrist spread (right − left), anchor-proof
 SPREAD_MAX = 0.80
 DROP_MIN = 0.22       # m — pose-A wrists must sit at least this far ABOVE pose B
@@ -325,10 +325,11 @@ def fit_two_pose(pose_a: dict[str, np.ndarray], pose_b: dict[str, np.ndarray],
 
 
 class NeutralPoseCalibration:
-    """The guided three-pose capture: rest (arms down at the sides) → clap
-    (palms together) → extended-forward LAST, each held still HOLD_S. Ending
-    on the extended pose means the fit completes while the operator already
-    holds the robot's neutral correspondence. Drives `status` dicts the
+    """The guided three-pose capture: extended-forward → clap (palms together)
+    → rest (arms down at the sides) LAST, each held still HOLD_S. Ending on the
+    arms-down pose means the fit completes while the operator is already at the
+    robot's HOME pose (and arms-down is the easiest pose to hold still, so the
+    capture closes reliably). Drives `status` dicts the
     dashboard renders as the prompt. Clock-injected and deterministic; the
     engine feeds it body-relative wrist samples each tick."""
 
@@ -345,24 +346,26 @@ class NeutralPoseCalibration:
         self.pos_scale = float(m.get("pos_scale", 1.0))
         self.robot_clap_gap = float(m.get("robot_clap_gap", 0.12))
         self.active = False
-        self.phase = "idle"      # idle | wait_rest | wait_clap | wait_fwd | done | cancelled
+        self.phase = "idle"      # idle | wait_fwd | wait_clap | wait_rest | done | cancelled
         self.result: CalibResult | None = None
         self._t0 = 0.0
         self._hold_t0: float | None = None
         self._buf: dict[str, list[tuple[float, np.ndarray]]] = {s: [] for s in SIDES}
-        self._pose_b: dict[str, np.ndarray] | None = None
-        self._pose_c: dict[str, np.ndarray] | None = None
+        self._pose_a: dict[str, np.ndarray] | None = None   # forward (extended) — reference
+        self._pose_b: dict[str, np.ndarray] | None = None   # rest (arms down = home), captured LAST
+        self._pose_c: dict[str, np.ndarray] | None = None   # clap (palms together)
         self._msg = ""
         self._seen = {s: False for s in SIDES}
 
     # ---- lifecycle --------------------------------------------------------- #
     def start(self, t: float) -> None:
         self.active = True
-        self.phase = "wait_rest"
+        self.phase = "wait_fwd"
         self.result = None
         self._t0 = t
         self._hold_t0 = None
         self._buf = {s: [] for s in SIDES}
+        self._pose_a = None
         self._pose_b = None
         self._pose_c = None
         self._msg = ""
@@ -411,23 +414,23 @@ class NeutralPoseCalibration:
         return means
 
     def _pose_ready(self, t: float) -> bool:
-        """Anchor-proof gates (nothing trusts an absolute frame): pose 1 (rest)
-        needs a sane lateral SPREAD; pose 2 (palms together) needs the wrists
-        CLOSE and raised up from the rest pose; pose 3 (extended forward)
-        needs a sane spread AND the wrists RAISED ≥ DROP_MIN above rest."""
+        """Anchor-proof gates (nothing trusts an absolute frame). Capture order is
+        forward → clap → rest, so pose 1 (extended-forward) is the REFERENCE and
+        only needs a sane lateral SPREAD; pose 2 (palms together) needs the wrists
+        CLOSE; pose 3 (rest, arms down) needs a sane spread AND the wrists DROPPED
+        ≥ DROP_MIN BELOW the forward reference (= relaxed down at the sides)."""
         means = self._still_means(t)
         if means is None:
             return False
         spread = abs(means["right"][0] - means["left"][0])
         if self.phase == "wait_clap":
-            raised = float(np.mean([means[s][1] - self._pose_b[s][1] for s in SIDES]))
-            return spread <= CLAP_SPREAD_MAX and raised >= RAISE_MIN
+            return spread <= CLAP_SPREAD_MAX
         if not (SPREAD_MIN <= spread <= SPREAD_MAX):
             return False
-        if self.phase == "wait_rest":
+        if self.phase == "wait_fwd":
             return True
-        raised = float(np.mean([means[s][1] - self._pose_b[s][1] for s in SIDES]))
-        return raised >= DROP_MIN
+        dropped = float(np.mean([self._pose_a[s][1] - means[s][1] for s in SIDES]))
+        return dropped >= DROP_MIN
 
     def _advance(self, t: float) -> None:
         means = {}
@@ -437,19 +440,20 @@ class NeutralPoseCalibration:
                 self._hold_t0 = None
                 return
             means[s] = win.mean(axis=0)
-        if self.phase == "wait_rest":
-            self._pose_b = means
+        if self.phase == "wait_fwd":
+            self._pose_a = means                      # forward (A) — the reference
             self.phase = "wait_clap"
             self._hold_t0 = None
             self._buf = {s: [] for s in SIDES}       # fresh windows for the next pose
             return
         if self.phase == "wait_clap":
-            self._pose_c = means
-            self.phase = "wait_fwd"
+            self._pose_c = means                      # clap (C)
+            self.phase = "wait_rest"
             self._hold_t0 = None
             self._buf = {s: [] for s in SIDES}
             return
-        res = fit_two_pose(means, self._pose_b, self.robot_neutral, self.robot_rest,
+        # wait_rest (LAST): means = rest (B); forward (A) already captured.
+        res = fit_two_pose(self._pose_a, means, self.robot_neutral, self.robot_rest,
                            self.pos_scale, pose_c=self._pose_c,
                            robot_clap_gap=self.robot_clap_gap)
         if res is None:                               # degenerate capture — keep waiting
@@ -473,7 +477,7 @@ class NeutralPoseCalibration:
     def status(self, t: float) -> dict:
         if self.active and self._hold_t0 is not None:
             elapsed = t - self._hold_t0
-            step = {"wait_rest": "1/3", "wait_clap": "2/3"}.get(self.phase, "3/3")
+            step = {"wait_fwd": "1/3", "wait_clap": "2/3"}.get(self.phase, "3/3")
             return {"active": True, "kind": "neutral", "phase": "hold",
                     "progress": min(1.0, elapsed / HOLD_S),
                     "remaining": max(0.0, HOLD_S - elapsed),
@@ -484,10 +488,10 @@ class NeutralPoseCalibration:
                 msg = "CALIBRATION: wear the headset, controllers down — both hands in view"
             elif self.phase == "wait_clap":
                 msg = "CALIBRATION 2/3: PRESS YOUR PALMS TOGETHER in front of your chest — and hold"
-            elif self.phase == "wait_fwd":
-                msg = "CALIBRATION 3/3: EXTEND BOTH ARMS straight forward at shoulder height — and hold"
+            elif self.phase == "wait_rest":
+                msg = "CALIBRATION 3/3: RELAX BOTH ARMS DOWN at your sides (home pose) — and hold"
             else:
-                msg = "CALIBRATION 1/3: RELAX BOTH ARMS DOWN at your sides — and hold"
+                msg = "CALIBRATION 1/3: EXTEND BOTH ARMS straight forward at shoulder height — and hold"
             return {"active": True, "kind": "neutral", "phase": self.phase, "progress": 0.0,
                     "remaining": HOLD_S, "left": self._seen["left"],
                     "right": self._seen["right"], "msg": msg}

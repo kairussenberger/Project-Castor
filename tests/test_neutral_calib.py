@@ -265,14 +265,14 @@ def _drive(npc: NeutralPoseCalibration, w_left, w_right, t0, t1, hz=30.0):
 
 
 def _drive_two_pose(npc, pa=POSE_A, pb=POSE_B, pc=POSE_C, t0=0.0):
-    # Capture order: rest → clap → extended-forward LAST.
-    t = _drive(npc, pb["left"], pb["right"], t0, t0 + 8.0)
+    # Capture order: extended-forward → clap → rest (arms-down = home) LAST.
+    t = _drive(npc, pa["left"], pa["right"], t0, t0 + 8.0)
     if npc.phase != "wait_clap":
         return t
     t = _drive(npc, pc["left"], pc["right"], t + 0.1, t + 12.0)
-    if npc.phase != "wait_fwd":
+    if npc.phase != "wait_rest":
         return t
-    return _drive(npc, pa["left"], pa["right"], t + 0.1, t + 24.0)
+    return _drive(npc, pb["left"], pb["right"], t + 0.1, t + 24.0)
 
 
 def test_capture_completes_three_poses():
@@ -291,40 +291,40 @@ def test_capture_with_recentered_anchor_completes():
     delta = np.array([0.1, -0.5, 0.2])
     npc = NeutralPoseCalibration(_rig())
     npc.start(0.0)
-    _drive(npc, POSE_B["left"] + delta, POSE_B["right"] + delta, 0.0, 8.0)
-    assert npc.phase == "wait_clap", "rest pose refused under anchor shift"
+    _drive(npc, POSE_A["left"] + delta, POSE_A["right"] + delta, 0.0, 8.0)
+    assert npc.phase == "wait_clap", "forward pose refused under anchor shift"
     _drive(npc, POSE_C["left"] + delta, POSE_C["right"] + delta, 8.1, 20.0)
-    assert npc.phase == "wait_fwd"
-    _drive(npc, POSE_A["left"] + delta, POSE_A["right"] + delta, 20.2, 32.0)
+    assert npc.phase == "wait_rest"
+    _drive(npc, POSE_B["left"] + delta, POSE_B["right"] + delta, 20.2, 32.0)
     assert npc.phase == "done" and npc.result is not None
     assert npc.result.lat_center == pytest.approx(0.1, abs=1e-3)
 
 
-def test_capture_pose_fwd_requires_arm_raise():
-    """Holding the rest pose again at step 3/3 must not complete — the
-    extended pose needs the wrists RAISED ≥ DROP_MIN above the rest pose."""
+def test_capture_pose_rest_requires_arm_drop():
+    """Holding the forward pose again at step 3/3 must not complete — the rest
+    pose needs the wrists DROPPED ≥ DROP_MIN below the forward reference."""
     npc = NeutralPoseCalibration(_rig())
     npc.start(0.0)
-    _drive(npc, POSE_B["left"], POSE_B["right"], 0.0, 8.0)
+    _drive(npc, POSE_A["left"], POSE_A["right"], 0.0, 8.0)
     assert npc.phase == "wait_clap"
     _drive(npc, POSE_C["left"], POSE_C["right"], 8.1, 20.0)
-    assert npc.phase == "wait_fwd"
-    _drive(npc, POSE_B["left"], POSE_B["right"], 20.2, 28.0)
-    assert npc.active and npc.phase == "wait_fwd"            # still waiting for the raise
+    assert npc.phase == "wait_rest"
+    _drive(npc, POSE_A["left"], POSE_A["right"], 20.2, 28.0)
+    assert npc.active and npc.phase == "wait_rest"           # still waiting for the drop
 
 
 def test_capture_rejects_crossed_or_narrow_hands():
     npc = NeutralPoseCalibration(_rig())
     npc.start(0.0)
     _drive(npc, [0.02, 0.1, 0.40], [-0.02, 0.1, 0.40], 0.0, 6.0)   # crossed/narrow
-    assert npc.active and npc.phase == "wait_rest"
+    assert npc.active and npc.phase == "wait_fwd"
 
 
 def test_capture_waits_for_both_hands():
     npc = NeutralPoseCalibration(_rig())
     npc.start(0.0)
-    _drive(npc, POSE_B["left"], None, 0.0, 6.0)
-    assert npc.active and npc.phase == "wait_rest"
+    _drive(npc, POSE_A["left"], None, 0.0, 6.0)
+    assert npc.active and npc.phase == "wait_fwd"
     st = npc.status(6.0)
     assert st["left"] and not st["right"]
 
@@ -332,9 +332,9 @@ def test_capture_waits_for_both_hands():
 def test_capture_motion_resets_hold():
     npc = NeutralPoseCalibration(_rig())
     npc.start(0.0)
-    _drive(npc, POSE_B["left"], POSE_B["right"], 0.0, 1.5)
+    _drive(npc, POSE_A["left"], POSE_A["right"], 0.0, 1.5)
     assert npc.active
-    _drive(npc, POSE_B["left"] + [0, 0.08, 0], POSE_B["right"], 1.5 + 1 / 30, 1.8)
+    _drive(npc, POSE_A["left"] + [0, 0.20, 0], POSE_A["right"], 1.5 + 1 / 30, 1.8)
     assert npc._hold_t0 is None
     assert npc.active
 
@@ -350,13 +350,13 @@ def test_capture_timeout_cancels():
 def test_status_prompts_walk_the_operator():
     npc = NeutralPoseCalibration(_rig())
     npc.start(0.0)
-    npc.tick({"left": POSE_B["left"], "right": POSE_B["right"]}, 0.0)
-    assert "1/3" in npc.status(0.0)["msg"] or "RELAX" in npc.status(0.0)["msg"]
-    t = _drive(npc, POSE_B["left"], POSE_B["right"], 0.0, 8.0)
+    npc.tick({"left": POSE_A["left"], "right": POSE_A["right"]}, 0.0)
+    assert "1/3" in npc.status(0.0)["msg"] or "EXTEND" in npc.status(0.0)["msg"]
+    t = _drive(npc, POSE_A["left"], POSE_A["right"], 0.0, 8.0)
     assert npc.phase == "wait_clap"
     assert "2/3" in npc.status(t)["msg"]
     t = _drive(npc, POSE_C["left"], POSE_C["right"], t + 0.1, t + 12.0)
-    assert npc.phase == "wait_fwd"
+    assert npc.phase == "wait_rest"
     assert "3/3" in npc.status(t)["msg"]
 
 
@@ -410,7 +410,7 @@ def test_engine_capture_freezes_arms_applies_and_persists(tmp_path):
     t, dt = 0.0, 1.0 / 30.0
     while t < 30.0:
         ph = eng.neutral.phase
-        w = wb if (ph == "wait_rest" or t < 0.1) else (wc if ph == "wait_clap" else wa)
+        w = wa if (ph == "wait_fwd" or t < 0.1) else (wc if ph == "wait_clap" else wb)
         eng.tick(_frame_with_wrist_body(w, t), {"left": True, "right": True}, t)
         if eng.calib_summary is not None:
             break

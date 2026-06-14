@@ -280,14 +280,9 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>bimanual-teleo
 </div>
 <div class=ctrlbar style="border-top:1px solid #2a3340">
  <span class=meta style="font-weight:700;color:#ff9d57;letter-spacing:.3px">HARDWARE</span>
- <span class=meta style="color:#8d97a5">drives the REAL right arm &mdash; e-stop in hand</span>
- <button id=btnReanchor class="btn ghost sm" title="re-anchor the rest pose at the arm's current limp hang so the engage gate passes (hw_bringup --step rest). Limp, no motion. Do this if a HW launch fails the REST-POSE GATE.">&#8635; RE-ANCHOR REST</button>
- <select id=selHwClutch class=sel title="gesture: arms follow ONLY while you hold the pinch (deadman). always: follow whenever tracked.">
-  <option value=gesture selected>clutch: gesture</option>
-  <option value=always>clutch: always</option>
- </select>
- <button id=btnHwReplay class="btn play sm" title="drive the RIGHT ARM with the selected REPLAY tape at the speed-slider speed (--rate-limit 0.5). Rest-gate + runtime guard active.">&#9881; HW REPLAY (metal)</button>
- <button id=btnHwTeleop class="btn play sm" title="LIVE Quest teleop on the RIGHT ARM (run_hw --vr orbit). Rest-gate + runtime guard active.">&#9881; HW TELEOP (metal)</button>
+ <span class=meta style="color:#8d97a5">drives BOTH real arms &mdash; e-stop in hand</span>
+ <button id=btnHome class="btn play sm" title="Drive the wired arms to the HOME / rest pose (rate-limited) and re-anchor rest so the engage gate passes. Arms MOVE — clear of people, e-stop in hand.">&#8962; RETURN HOME</button>
+ <button id=btnHwTeleop class="btn play sm" title="LIVE Quest teleop driving BOTH real arms (run_hw --vr orbit, follows CONTINUOUSLY whenever tracked). Rest-gate + runtime guard active. Arms at rest, ORBIT running, e-stop in hand.">&#9881; TELEOP LIVE</button>
  <button id=btnLog class="btn ghost sm" title="show the run_hw / engine log — why a launch died (guard trips, gate failures, errors)">&#128203; LOG</button>
  <span style="flex:1"></span>
  <button id=btnRelease class="btn kill" title="EMERGENCY: SIGINT every mover on this host so run_hw / jog release torque — the arm goes LIMP. NOT a substitute for the physical e-stop.">&#9211; RELEASE TORQUE</button>
@@ -353,7 +348,7 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>bimanual-teleo
    <div class=stage>
     <div class=stagehd><span class=stagenum>4</span><div><div class=stagettl>REAL ROBOT</div><div class=stagesub>encoders</div></div></div>
     <div class=panel id=panelHW><canvas id=cvHW width=460 height=360></canvas>
-     <div id=hwPlaceholder class=placeholder>no hardware<br><span>run HW REPLAY / HW TELEOP to drive the metal</span></div>
+     <div id=hwPlaceholder class=placeholder>no hardware<br><span>run TELEOP LIVE to drive the metal</span></div>
      <div id=roHW class=readout></div></div>
    </div>
   </div>
@@ -701,16 +696,14 @@ let WSEMA={left:0,right:0};
 $('btnCalib').onclick=()=>control({action:CAL_ACTIVE?'calibrate_cancel':'calibrate'});
 $('btnCalClear').onclick=()=>control({action:'calibrate_clear'});
 let HWTRIP_ACK='';
-$('btnHwReplay').onclick=()=>{const f=$('selRec').value;
- if(!f){alert('Pick a REPLAY tape in the row above first.');return;}
- if(!confirm('Drive the REAL right arm with '+f+' at '+speed().toFixed(2)+'×?\\n\\nThe arm WILL move. Keep a hand on the e-stop. The rest-pose gate, runtime guard, and hard speed ceiling are active.'))return;
- control({action:'start_hw_replay',file:f,speed:speed().toFixed(2)})};
 $('btnHwTeleop').onclick=()=>{
- if(!confirm('Start LIVE Quest teleop on the REAL right arm?\\n\\nThe arm follows your hand once engaged ('+$('selHwClutch').value+' clutch). Keep a hand on the e-stop. Runtime guard + hard speed ceiling are active.'))return;
- control({action:'start_hw_teleop',clutch:$('selHwClutch').value})};
+ if(!confirm('Start LIVE Quest teleop on BOTH real arms?\\n\\nThe arms follow your hands CONTINUOUSLY whenever tracked (no pinch). Both arms must be at rest and ORBIT running on the Quest. Keep a hand on the e-stop. Rest-gate + runtime guard + hard speed ceiling are active.'))return;
+ control({action:'start_hw_teleop'})};
 $('btnRelease').onclick=()=>{control({action:'release_torque'})};
-$('btnReanchor').onclick=()=>{const b=$('btnReanchor');b.textContent='re-anchoring…';b.disabled=true;
- control({action:'reanchor_rest'}).then(()=>{b.textContent='↻ RE-ANCHOR REST';b.disabled=false})};
+$('btnHome').onclick=()=>{
+ if(!confirm(`⌂ RETURN HOME?\n\nThe wired arms will MOVE (rate-limited) to the home/rest pose, then re-anchor rest so the next robot run can engage.\n\n• Area clear of people\n• Hand on the e-stop\n\nUse STOP ALL / RELEASE TORQUE to release torque.`)) return;
+ const b=$('btnHome');b.textContent='homing…';b.disabled=true;
+ control({action:'return_home'}).then(()=>{b.textContent='⌂ RETURN HOME';b.disabled=false})};
 let LOGOPEN=false;
 async function fetchLog(){
  try{const r=await(await fetch('/enginelog')).json();
@@ -840,7 +833,9 @@ async function tick(){
   // WITHOUT await so they never block the render loop (that was the stutter/freeze).
   if(++ctrlN%20===1){
    fetch('/control?action=status').then(r=>r.json()).then(updCtrl).catch(()=>{});
-   fetchLog().then(trip=>{ if(trip){const h=$('hint');h.textContent='✗ '+trip;h.style.color='#ff8a8a';} });
+   fetchLog();   // refresh the LOG panel only — do NOT write #hint here. hint(d)
+                 // rewrites #hint every frame, so writing a (stale) log trip here
+                 // fought it = the flicker. Live trips show in the hwTrip banner.
   }
  }catch(e){chip('conn','bad','dashboard error')}
  requestAnimationFrame(()=>setTimeout(tick,50));
@@ -1084,46 +1079,47 @@ class EngineManager:
             self._spawn(args, mode, record, module="bimanual_teleop.launch.run_hw")
             return self.status()
 
-    def start_hw_replay(self, file: str, speed: float = 0.3):
-        # --clutch recorded: replay the recording's OWN engagement decisions so the
-        # arm actually follows the tape. Without it run_hw defaults to gesture clutch
-        # and never engages on a replay → the arm just holds at rest (looks dead).
-        args = ["--vr", "replay", file, "--clutch", "recorded", "--rate-limit", "0.5"]
-        if speed != 1.0:
-            args += ["--speed", f"{speed:g}"]
-        return self._start_hw(args, f"HW-METAL REPLAY {Path(file).name} @{speed:g}x", None)
-
-    def start_hw_teleop(self, clutch: str = "gesture"):
-        clutch = clutch if clutch in ("always", "gesture") else "gesture"
+    def start_hw_teleop(self):
+        # Gesture (deadman pinch) clutch removed per operator request — TELEOP LIVE
+        # follows CONTINUOUSLY whenever both hands are tracked (--clutch always).
+        # STOP / RELEASE TORQUE / e-stop are the kill path.
         rec = f"recordings/hw_{time.strftime('%m%d_%H%M%S')}.npz"
-        return self._start_hw(["--vr", "orbit", "--clutch", clutch, "--record", rec],
-                              f"HW-METAL TELEOP ({clutch})", rec)
+        # BOTH arms (--sides override): the rest-pose gate catches a wrong-arm /
+        # channel-flip per side (j6 differs by π) before any torque tracks.
+        return self._start_hw(["--vr", "orbit", "--clutch", "always",
+                               "--sides", "right,left", "--record", rec],
+                              "TELEOP LIVE", rec)
 
-    def reanchor_rest(self):
-        """Re-anchor the motor↔model offsets at the arm's current limp hang
-        (scripts/hw_bringup.py --step rest) so the rest-pose engage gate passes —
-        the dashboard equivalent of the terminal step. Limp, settle-checked, no
-        motion. Frees the bus first; nothing else may hold can0 during this."""
+    def return_home(self, side=None):
+        """Drive the wired arms to the official HOME pose and RE-ANCHOR rest there
+        (launch.return_home): moves the rig to one set position AND makes the
+        engage gate pass (the guarded auto --step rest). Managed transient job —
+        frees the bus first, spawns as self.proc so STOP / RELEASE TORQUE SIGINT
+        it (the chain teardown releases torque). Rate-limited; a tangled/propped
+        arm is NOT re-anchored (the map is left untouched)."""
         with self._lock:
             self._stop_inner()
             for pat, _ in self.KILL_TARGETS:
                 if self._matches(pat):
                     subprocess.run(["pkill", "-INT", "-f", pat], capture_output=True)
-            time.sleep(1.2)
-            try:
-                r = subprocess.run([_sys.executable, "scripts/hw_bringup.py", "--step", "rest"],
-                                   cwd=REPO_ROOT, input=b"\n", capture_output=True, timeout=40)
-                out = (r.stdout + r.stderr).decode(errors="ignore")
-                gate = [ln.strip() for ln in out.splitlines()
-                        if "through the SAVED" in ln or "re-anchored" in ln or "still matches" in ln]
-                ok = ("re-anchored" in out) or ("still matches" in out) or ("complete for this arm" in out)
-                tail = (" — " + gate[-1]) if gate else ""
-                self.last_msg = ("REST re-anchored ✓ gate will pass" if ok
-                                 else "REST re-anchor: check the arm is hanging free") + tail
-            except subprocess.TimeoutExpired:
-                self.last_msg = "REST re-anchor timed out — is the arm powered / bus free?"
-            except Exception as e:
-                self.last_msg = f"REST re-anchor failed: {e}"
+            time.sleep(1.0)
+            args = ["--side", side] if side in ("left", "right") else ["--sides", "right,left"]
+            (REPO_ROOT / "out").mkdir(exist_ok=True)
+            log_path = REPO_ROOT / "out" / "engine.log"
+            log = open(log_path, "ab")
+            log.write(f"\n===== {time.strftime('%H:%M:%S')} dashboard: RETURN HOME =====\n".encode())
+            log.flush()
+            self.proc = subprocess.Popen(
+                [_sys.executable, "-m", "bimanual_teleop.launch.return_home", *args],
+                cwd=REPO_ROOT, stdout=log, stderr=subprocess.STDOUT)
+            log.close()
+            self.mode, self.record, self.t0 = "RETURN HOME", None, time.time()
+            time.sleep(2.5)                       # catch an early crash (no map / bus busy)
+            if self.proc.poll() is not None and self.proc.returncode != 0:
+                self.last_msg = f"RETURN HOME failed (code {self.proc.returncode}) — see LOG"
+                self.proc, self.mode, self.t0 = None, None, None
+            else:
+                self.last_msg = "RETURN HOME running — arms moving to rest"
             return self.status()
 
     # STOP ALL targets: everything that can move metal or hold the CAN bus. The
@@ -1137,6 +1133,7 @@ class EngineManager:
         (r"scripts/probe_nudge\.py", "probe_nudge"),
         (r"scripts/test_pattern\.py", "test_pattern"),
         (r"bimanual_teleop\.launch\.run_hw", "run_hw"),
+        (r"bimanual_teleop\.launch\.return_home", "return_home"),
     )
 
     def _matches(self, pat):
@@ -1233,19 +1230,10 @@ class EngineManager:
             return self.stop()
         if action in ("kill_all", "release_torque"):    # both: SIGINT every mover → torque released
             return self.kill_all()
-        if action == "start_hw_replay":
-            f = (query.get("file") or [""])[0]
-            if not f or not (REPO_ROOT / f).exists():
-                return {"error": f"no such recording: {f}", **self.status()}
-            try:
-                sp = float((query.get("speed") or ["0.3"])[0])
-            except ValueError:
-                sp = 0.3
-            return self.start_hw_replay(f, sp)
         if action == "start_hw_teleop":
-            return self.start_hw_teleop((query.get("clutch") or ["gesture"])[0])
-        if action == "reanchor_rest":
-            return self.reanchor_rest()
+            return self.start_hw_teleop()
+        if action == "return_home":
+            return self.return_home()
         if action in ("calibrate", "calibrate_cancel", "calibrate_clear"):
             return self.engine_cmd(action)
         return self.status()

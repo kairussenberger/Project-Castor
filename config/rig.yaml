@@ -17,14 +17,14 @@ arms:
   # stand's Y-face plates; hand_pos/hand_euler are the measured flange→ORCA-hand
   # transform; neutral_q is the home pose (j1=±90° → arms face forward, world −X).
   left:
-    can_channel: can1                  # hardware (Linux): SocketCAN interface — NOT WIRED YET (see hardware.sides)
+    can_channel: can0                  # LEFT arm currently enumerates on can0 (2026-06-14). gs_usb can0/can1 can flip on replug — if a scan shows the wrong arm, swap these two can_channel lines.
     base_pos: [-0.0248, -0.1700, 1.1908]   # Kai c2814b4: +0.5m on the real elongated stand (0.69->1.19)
     base_quat: [0.49791, 0.50194, -0.50011, -0.50004]
     hand_pos: [-0.0504, 0.1078, 0.0]   # flange (link5) → ORCA hand base
     hand_euler: [0.0, 3.14159, 0.0]    # palm-down, thumb-inward at home
     neutral_q: [3.137, -0.004, 0.305, -0.162, -0.003, -1.571]   # FROZEN official rest pose — see docs/RESTING_POSE.md, DO NOT CHANGE. ragdoll hang + j6 -90° palm-inward
   right:
-    can_channel: can0                  # single gs_usb adapter today = right arm; VERIFY with scripts/hw_bringup.py --step scan
+    can_channel: can1                  # RIGHT arm currently enumerates on can1 (2026-06-14)
     base_pos: [0.0101, 0.0801, 1.1875]   # Kai c2814b4: +0.5m on the real elongated stand (0.69->1.19)
     base_quat: [0.49989, 0.49988, 0.50055, 0.49968]
     hand_pos: [-0.0306, 0.1078, 0.0]
@@ -155,6 +155,55 @@ safety:
   # to CONTACT distance — palms, fingers, or fingertips-to-palm — never through.
   hand_min_separation: 0.12
   hand_capsule_len: 0.19
+  # LINK-vs-LINK + LINK-vs-TORSO avoidance (safety/separation chains + engine.
+  # _separate_arms). The hand guard above only protects the wrist→fingertip
+  # capsules; with BOTH arms live the FOREARMS/ELBOWS/UPPER-ARMS can collide while
+  # the hands are far apart, and either arm can drive into the central stand —
+  # neither was guarded before (ik.py: "cross-arm collision is mitigated upstream"
+  # had NO link-vs-link check). Each arm is modeled as a CHAIN OF CAPSULES from
+  # its live IK link polyline (base→j1..j6→ee, ArmIK.link_points mapped to world
+  # like the render sink), each segment a capsule of radius arm_link_radius. Every
+  # tick, after the hand guard, each ENGAGED side's chain is kept ≥
+  # arm_min_separation (SURFACE distance = centerline gap − 2·arm_link_radius)
+  # from the OTHER arm's chain (a parked arm is a FIXED obstacle, like the hand
+  # guard) and from the torso column; violations push that side's wrist TARGET
+  # along the closest-point axis and re-solve (the shaper/IK still clamp).
+  arm_min_separation: 0.06    # m surface gap kept between the two arm link chains
+  arm_link_radius: 0.045      # m capsule radius around each arm link segment (YAM link half-thickness + margin)
+  # AUTO-HOME collision buffer (hardware.drive_to_rest / scripts/home_arm.py). When
+  # an off-rest arm is auto-driven BACK to rest, its FK link chain is sampled along
+  # the joint-space glide vs the torso column (safety.torso) AND the other wired arm
+  # (at its measured pose); if the SURFACE clearance to either drops below this, the
+  # homing HOLDS its last safe command (no lurch, no torque release) and aborts
+  # instead of pushing through. Same capsule radii as the live arm-vs-torso guard
+  # (arm_link_radius + torso.radius). 0.03 m keeps a 3 cm buffer off the obstacle.
+  home_clearance: 0.03        # m surface buffer the homing glide keeps from torso/other arm
+  # Predict-correct passes per tick (the chain geometry needs the SOLVED config,
+  # so each pass re-solves the IK from the adjusted wrist target). Pushing the
+  # wrist target by the surface deficit only moves a MID-CHAIN colliding link
+  # (forearm/elbow) fractionally, so a deep approach closes Gauss-Seidel style
+  # over several passes; ~5 fully resolves a forearm-into-torso reach. The loop
+  # breaks early when no side is pushed, so far-apart arms cost nothing extra.
+  arm_sep_passes: 5
+  # The TORSO/STAND as a static capsule obstacle: a vertical column near the rig
+  # CENTER that neither arm may drive into. Placed from the measured geometry —
+  # the two arm bases sit on the stand's Y-face plates at the SHOULDER line
+  # (z≈1.19; midpoint of arms.left/right.base_pos = [-0.007, -0.045, 1.189]), and
+  # the AgileX frame top is at stand.pos z (0.2475). So the column runs from the
+  # shoulder line straight DOWN to the stand base at that center XY. radius 0.09 m
+  # wraps the stand uprights/electronics box; min_separation 0.05 m is the surface
+  # gap kept (centerline gap − arm_link_radius − torso.radius). Adjust p0/p1 if the
+  # stand body or a payload occupies more space.
+  torso:
+    p0: [-0.007, -0.045, 1.19]   # top of the column — the shoulder line between the two arm bases
+    p1: [-0.007, -0.045, 0.25]   # bottom — the AgileX stand base (stand.pos z)
+    radius: 0.09                 # m around the central stand body
+    min_separation: 0.05         # m surface gap kept between any arm link and the torso column
+    # The arm's first link (base→j1) IS the rigid stand mount (sits ~12.6 cm from
+    # the column by construction; the wrist target can never move it). Skip this
+    # many leading chain points for the TORSO check so the mount geometry is not
+    # flagged as a collision (arm-vs-arm keeps the whole chain). 1 = drop base→j1.
+    skip_base_links: 1
   # Motion guardrails (sim AND the gateway to hardware). Every cap below is per
   # SECOND of wall-clock time (integrated with the real dt), NOT per frame — the
   # governed motion is identical at any loop/headset rate, so what the sim shows
@@ -274,10 +323,25 @@ hardware:
   smooth_hz: 3.0      # critically-damped command tracker bandwidth (the "PD" feel)
   accel_limit: 12.0   # rad/s² per-joint accel cap — velocity RAMPS, never slams
                       # (no-overshoot needs ≥ 0.37·rate·2π·hz ≈ 8.4; 1.4× margin)
+  # AUTO-HOME to rest. When an arm is OFF rest at session start (rest-pose gate
+  # below would otherwise REFUSE to start), gently drive it BACK to the rest pose
+  # by itself — shaped/rate-limited through the same JointCommandShaper, runtime
+  # guard ACTIVE every tick — instead of refusing and waiting for a human to
+  # reposition it. The target IS the official gravity hang, so this is the safest
+  # motion the arm can make. ONLY done when every joint is within auto_home_max of
+  # rest; a GROSS deviation (wrong arm on the bus, or a huge map error) is still
+  # ABORTED so a human looks at it. Opt-in (the code default is OFF → byte-identical
+  # legacy refuse-and-raise behaviour); this flag turns it on for this rig.
+  auto_home_to_rest: false   # HELD OFF pending verification. The collision-aware drive_to_rest is in the tree but NOT yet confirmed safe on metal — it re-enabled itself prematurely and rammed the torso. Re-enable ONLY after the safety review passes AND a careful e-stop-ready test. Until then: position the arm by hand.
+  #                j1   j2   j3   j4   j5   j6   max rad off-rest we will auto-drive
+  auto_home_max: [0.8, 0.8, 0.8, 0.8, 2.0, 2.0]   # to rest, else abort. j6 wrong-arm
+                      # is ~π=180° ≫ 2.0 so a WRONG ARM still refuses; a harmless ±2π
+                      # boot-wrap reads ~0 via shortest-arc and stays well within.
+  auto_home_timeout_s: 20.0   # give up driving to rest after this (then still refuse)
   # Which arms are physically wired — ONLY these are opened/commanded; the
   # engine's output for other sides is dropped at the sink. Add 'left' when its
   # CAN adapter is connected (and verified with hw_bringup --step scan).
-  sides: [right]
+  sides: [right]   # SINGLE ARM (2026-06-14): reverted from [left, right] — two live arms + flippable gs_usb channels applied the wrong-sign map to the wrong arm and slammed j3 under run_hw. Re-add 'left' only after the CAN channels are locked (config/99-yam-can.rules) and each arm re-verified separately.
   # ORCA hands: RealHand MOVES the hand to neutral at connect — keep false until
   # the hands are mounted, tensioned, and on their serial buses.
   use_hands: false
@@ -292,7 +356,7 @@ hardware:
   # j5/j6 (still catches a π wrong-arm flip — 180° ≫ 69°). No re-anchoring needed for
   # normal drift; the clean map just works.
   #                  j1    j2    j3    j4    j5    j6
-  engage_pose_tol: [0.15, 0.15, 0.15, 0.20, 1.20, 1.20]   # rad (8.6/8.6/8.6/11/69/69°)
+  engage_pose_tol: [0.30, 0.30, 0.30, 0.30, 1.20, 1.20]   # rad (17/17/17/17/69/69°) — loosened j1-j4 2026-06-14 so a slightly-drifted hang still engages; still ≪ wrong-arm (180°)/±2π so those are caught
   # Per-machine motor↔model joint calibration written by scripts/hw_bringup.py
   # (signs measured on metal; offsets anchored at the resting pose). Gitignored.
   joint_map_file: config/hw_joint_map.json
