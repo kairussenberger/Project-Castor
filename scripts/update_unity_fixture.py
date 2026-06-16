@@ -27,6 +27,7 @@ def make_fixture() -> dict:
     rig = load_rig()
     rig["vr"]["calib_seconds"] = 0
     rig["vr"]["body_relative"] = True
+    rig.setdefault("mapping", {})["swap_sides"] = False   # canonical fixture = same-side mapping
     rig["vr"]["render_endpoint"] = "inproc://unity-fixture"
     rig["vr"]["unity_json_endpoint"] = None
 

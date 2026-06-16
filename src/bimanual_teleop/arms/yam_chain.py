@@ -41,18 +41,22 @@ STILL_PTP = 0.02    # rad: positions stable across the window
 TWO_PI = 2.0 * np.pi
 
 
-def wrap_corrections(positions: np.ndarray) -> np.ndarray:
-    """Per-joint k·2π offset corrections that bring reported angles into (−π, π].
-    Pure so it is unit-testable; handles multi-turn readings (e.g. +5.44 → −0.85
-    via one +2π offset, +9.0 → +2.72 via one, +9.7 → −2.86 via two)."""
+def wrap_corrections(positions: np.ndarray, ref: np.ndarray | float = 0.0) -> np.ndarray:
+    """Per-joint k·2π offset corrections that bring reported angles to within ±π of
+    `ref` (default 0 ⇒ into (−π, π]). Pure so it is unit-testable; handles multi-turn
+    readings (e.g. +5.44 → −0.85 via one +2π offset, +9.0 → +2.72 via one,
+    +9.7 → −2.86 via two). When `ref` is the rest/home motor pose, reads land in the
+    SAME continuous frame as the joint map, so a joint parked on the ±π boundary
+    (this rig's j2 ≈ ±177° at rest) never flips a full turn between samples — which
+    otherwise makes the engage gate flaky and turns a HOME command into a 350° sweep."""
     pos = np.asarray(positions, dtype=float)
-    return np.round(pos / TWO_PI) * TWO_PI
+    return np.round((pos - np.asarray(ref, dtype=float)) / TWO_PI) * TWO_PI
 
 
 class YamChain:
     """One YAM arm over SocketCAN, MOTOR space, our shaping — see module docstring."""
 
-    def __init__(self, channel: str, *, rate_deg_s: float = 10.0):
+    def __init__(self, channel: str, *, rate_deg_s: float = 10.0, wrap_ref=None):
         from i2rt.motor_drivers.dm_driver import DMChainCanInterface, MotorCmd, ReceiveMode
         from i2rt.robots.utils import ArmType, _load_arm_config
         cfg = _load_arm_config(ArmType.YAM)
@@ -63,6 +67,10 @@ class YamChain:
         self.n = len(cfg.motor_list)
         self.channel = channel
         self.rate = float(np.radians(rate_deg_s))
+        # Fold encoder reads to within ±π of this motor-space pose (the rest/home
+        # anchor) instead of (−π, π], so boundary joints stay in the map's frame.
+        self.wrap_ref = (None if wrap_ref is None
+                         else np.asarray(wrap_ref, dtype=float).reshape(-1)[: self.n])
         self.bounds: np.ndarray | None = None       # (n,2) motor-space command clamp
         self._clip_warned = np.zeros(self.n, dtype=bool)
         log.info("%s: opening %d motors %s (enable = torque-capable, ZERO command — limp)",
@@ -94,11 +102,15 @@ class YamChain:
             self.chain.commands = cmds
 
     def _normalize_wraps(self) -> None:
-        """Re-anchor offsets so reported angles land in (−π, π] — from a FRESH
-        read after the stream is up (the enable-frame echo is not trusted)."""
+        """Re-anchor offsets so reported angles land within ±π of the wrap reference
+        (the rest/home motor pose when known, else (−π, π]) — from a FRESH read after
+        the stream is up (the enable-frame echo is not trusted). Folding to the map's
+        rest frame keeps a boundary joint (j2 ≈ ±177°) from flipping a full turn
+        between reads, which otherwise makes the engage gate flaky and turns a HOME
+        command into a full-turn sweep."""
         time.sleep(0.05)
         pos = self.read_pos()
-        corr = wrap_corrections(pos)
+        corr = wrap_corrections(pos, 0.0 if self.wrap_ref is None else self.wrap_ref)
         if np.any(corr != 0.0):
             self.chain.motor_offset = self.chain.motor_offset + corr
             log.info("%s: wrap normalization %s turns → %s", self.channel,

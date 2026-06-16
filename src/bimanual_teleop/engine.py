@@ -56,6 +56,14 @@ class TeleopEngine:
         self.calibrated = self.calib_s <= 0
         self.body_relative = bool(rig.get("vr", {}).get("body_relative", True))
         self.torso_from_head = rig.get("vr", {}).get("torso_from_head", [0.0, -0.35, 0.0])
+        # Mirror the motion when the operator observes the robot from a mirrored
+        # viewpoint: forward = front↔back, lateral = left↔right (independent). Default off.
+        _m = rig.get("mapping", {})
+        self.mirror_forward = bool(_m.get("mirror_forward", False))
+        self.mirror_lateral = bool(_m.get("mirror_lateral", False))
+        # Swap which ARM follows which hand: right arm does the LEFT hand's motion and
+        # vice versa. Applied once here so EVERY path (live/replay/robot) is consistent.
+        self.swap_sides = bool(_m.get("swap_sides", False))
         self._calib_t0 = None
         self._prompted = False
         self._done_t = None
@@ -90,6 +98,9 @@ class TeleopEngine:
         self.cross_gap = float(rig.get("vr", {}).get("cross_gap", 0.05))
 
     def tick(self, frame: VRFrame | None, engaged: dict[str, bool], t: float) -> None:
+        if self.swap_sides and frame is not None and "left" in frame.hands and "right" in frame.hands:
+            frame.hands["left"], frame.hands["right"] = frame.hands["right"], frame.hands["left"]
+            engaged = {"left": engaged.get("right", False), "right": engaged.get("left", False)}
         self._drain_calib_requests(t)
         if not self.calibrated:
             self._calibration_tick(frame, t)
@@ -259,7 +270,9 @@ class TeleopEngine:
     def _arm_hand_sample(self, hs: HandSample | None, frame: VRFrame | None) -> HandSample | None:
         if not self.body_relative:
             return hs
-        return body_relative_hand_sample(hs, frame.head if frame else None, self.torso_from_head)
+        return body_relative_hand_sample(hs, frame.head if frame else None, self.torso_from_head,
+                                         mirror_forward=self.mirror_forward,
+                                         mirror_lateral=self.mirror_lateral)
 
     def _calibration_tick(self, frame: VRFrame | None, t: float) -> None:
         """Collect resting-stance samples; hold arms at the rest pose; fingers track."""

@@ -69,6 +69,7 @@ def main() -> int:
     rig["vr"]["calib_seconds"] = 0
     rig["vr"]["body_relative"] = True
     rig["vr"]["torso_from_head"] = [0.0, -0.35, 0.0]
+    rig.setdefault("mapping", {})["swap_sides"] = False   # this probe tests same-side mapping mechanics
     torso = np.asarray(rig["vr"]["torso_from_head"], dtype=float)
 
     # Torso-height, own-side, forward — inside the absolute-mapping workspace the

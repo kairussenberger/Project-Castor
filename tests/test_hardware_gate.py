@@ -19,11 +19,13 @@ class FakeYamArm:
     measured: dict[str, np.ndarray] = {}
 
     def __init__(self, channel: str, joint_map=None, *, require_map: bool = True,
-                 model_limits=None):
+                 model_limits=None, wrap_ref=None):
         assert joint_map is not None, "sink must pass the calibrated map"
         assert model_limits is not None, "sink must install the model-limit clamp"
+        assert wrap_ref is not None, "sink must fold reads to the rest frame (wrap_ref)"
         self.channel = channel
         self.map = joint_map
+        self.wrap_ref = np.asarray(wrap_ref, dtype=float)
         self.commands: list[np.ndarray] = []
         self.closed = False
         FakeYamArm.instances.append(self)

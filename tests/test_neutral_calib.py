@@ -257,6 +257,7 @@ def test_engine_capture_freezes_arms_applies_and_persists(tmp_path):
     rig = load_rig()
     calib_path = tmp_path / "operator_calib.json"
     rig["mapping"]["calib_file"] = str(calib_path)
+    rig["mapping"]["swap_sides"] = False   # this test pins per-side capture, not the operator swap
     sink = DummySink()
     eng = TeleopEngine(rig, sink)
     assert eng.calib_summary is None

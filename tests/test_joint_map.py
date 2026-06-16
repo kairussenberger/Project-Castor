@@ -82,6 +82,22 @@ def test_wrap_corrections_normalize_multiturn_readings():
     np.testing.assert_allclose(out[1], -3.0882, atol=1e-12)  # already in range — untouched
 
 
+def test_wrap_corrections_fold_to_rest_ref_keeps_boundary_joint_coherent():
+    """j2 parks on the ±π fold boundary (this rig's rest ≈ −177° motor). Folding reads
+    to (−π, π] flips them a full turn between samples (−175° one read, +175° the next),
+    so HOME glides the long way and the engage gate reads ~350° off. Folding to the
+    rest REF keeps reads in the map's frame: HOME is the short ~10° move, gate is stable."""
+    from bimanual_teleop.arms.yam_chain import wrap_corrections
+    ref = np.radians(-174.9)                       # right-arm j2 rest in motor space
+    read = np.radians(175.6)                        # same physical spot, opposite fold
+    folded = read - wrap_corrections(read, ref)
+    assert abs(folded - ref) <= np.pi                       # short way, by construction
+    assert np.degrees(abs(folded - ref)) < 15.0             # ~9.5° here, never ~350°
+    # default ref=0 is unchanged — back-compat with the (−π, π] normalization
+    p = np.array([5.4378, -3.0882, 9.7])
+    np.testing.assert_allclose(wrap_corrections(p, 0.0), wrap_corrections(p), atol=1e-12)
+
+
 def test_map_file_resolution(tmp_path):
     p = map_file_from_rig({"hardware": {"joint_map_file": str(tmp_path / "m.json")}})
     assert p == tmp_path / "m.json"

@@ -90,8 +90,10 @@ class HardwareSink:
                         f"{s} arm: no motor↔model calibration in {map_file}. "
                         "Run the guided bring-up first: uv run python scripts/hw_bringup.py"
                     )
+                neutral = np.asarray(rig["arms"][s]["neutral_q"], dtype=float)
                 arm = YamArm(rig["arms"][s]["can_channel"], jm,
-                             model_limits=rig["arms"]["joint_limits"])
+                             model_limits=rig["arms"]["joint_limits"],
+                             wrap_ref=jm.to_motor(neutral))   # fold reads to the rest frame
                 self.arms[s] = arm                     # tracked even if the gate fails → close() releases it
                 measured = arm.state()                 # model space — energized = PD-holding this pose
                 gate = rest_pose_gate(measured, rig["arms"][s]["neutral_q"], tol)
@@ -128,6 +130,16 @@ class HardwareSink:
         if side not in self.hands:
             return
         self.hands[side].set_joint_positions(joints_deg)
+
+    def telemetry(self) -> dict:
+        """Per-side motor health (temp/effort/measured) for the live dashboard."""
+        out = {}
+        for s, arm in self.arms.items():
+            try:
+                out[s] = arm.telemetry()
+            except Exception:
+                pass
+        return out
 
     def close(self) -> None:
         for h in getattr(self, "hands", {}).values():

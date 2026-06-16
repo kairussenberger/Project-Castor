@@ -169,6 +169,57 @@ def _make_sink(kind: str, rig: dict):
     return RenderSink(rig)
 
 
+JOG_UDP_PORT = 8202
+
+
+def _serve(jog: "JogSession", sink) -> int:
+    """Headless jog loop for the dashboard: hold the arms, stream render + motor
+    telemetry, and apply per-joint nudges arriving as UDP 'side joint deg' datagrams
+    (e.g. 'left 2 +10'). The shaper rate-limits every move; soft limits clamp it."""
+    import json
+    import socket
+    srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    srv.bind(("127.0.0.1", JOG_UDP_PORT))
+    srv.setblocking(False)
+    hw = getattr(sink, "hw", sink)
+    telem = REPO_ROOT / "out" / "hw_telemetry.json"
+    telem.parent.mkdir(exist_ok=True)
+    print(f"[jog] SERVER ready — udp {JOG_UDP_PORT} (side joint deg); Ctrl+C / STOP releases torque", flush=True)
+    t0 = time.monotonic()
+    last_telem = 0.0
+    try:
+        while True:
+            now = time.monotonic()
+            t = now - t0
+            for s in getattr(sink, "arms", {}):     # re-assert targets so the shaper glides the metal
+                sink.set_arm(s, jog.ik[s].q)
+            jog.publish(60.0, t)
+            if hasattr(hw, "telemetry") and now - last_telem > 0.2:
+                last_telem = now
+                try:
+                    telem.write_text(json.dumps({"wall": time.time(), "engaged": {}, "arms": hw.telemetry()}))
+                except Exception:
+                    pass
+            try:
+                while True:                          # drain all pending nudges
+                    data, _ = srv.recvfrom(256)
+                    p = data.decode(errors="ignore").split()
+                    if len(p) == 3 and p[0] in jog.ik and 0 <= int(p[1]) < 6:
+                        jog.side, jog.joint = p[0], int(p[1])
+                        jog.joint_step = abs(np.radians(float(p[2])))
+                        jog.step_joint(1 if float(p[2]) >= 0 else -1)
+                        print(f"[jog] {p[0]} j{int(p[1]) + 1} {float(p[2]):+.0f}°", flush=True)
+            except BlockingIOError:
+                pass
+            time.sleep(0.02)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if hasattr(sink, "close"):
+            sink.close()
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--sink", choices=["render", "hw"], default="render",
@@ -176,6 +227,9 @@ def main() -> int:
     ap.add_argument("--max-deg-s", type=float, default=10.0,
                     help="hw only: per-joint speed cap for this jog session "
                          "(default 10°/s — far below hardware.rate_limit; 0 = rig value)")
+    ap.add_argument("--server", action="store_true",
+                    help="headless dashboard jog: hold the arms and take per-joint nudges over "
+                         "UDP 127.0.0.1:8202 ('side joint deg') instead of the keyboard")
     args = ap.parse_args()
 
     rig = load_rig()
@@ -193,6 +247,9 @@ def main() -> int:
     print(__doc__.split("Keys:")[1])
     print(f"sink={args.sink}  |  watch on the dashboard: uv run python scripts/dashboard.py")
     print(jog.status_line(), flush=True)
+
+    if args.server:
+        return _serve(jog, sink)
 
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)

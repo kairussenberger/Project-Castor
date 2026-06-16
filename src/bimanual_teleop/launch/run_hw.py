@@ -18,8 +18,13 @@ or e-stop releases torque on all devices.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+TELEMETRY_PATH = REPO_ROOT / "out" / "hw_telemetry.json"
 
 from ..config import load_rig
 from ..engine import TeleopEngine
@@ -46,6 +51,14 @@ def main() -> int:
                     help="override rig hardware.sides — arms physically wired this session")
     ap.add_argument("--no-hands", action="store_true",
                     help="override rig hardware.use_hands=false (ORCA hands not mounted)")
+    ap.add_argument("--swap-sides", action="store_true",
+                    help="drive each recorded hand with the OPPOSITE arm (L/R mirror): "
+                         "the left hand commands the right arm and vice versa. Calibration "
+                         "and the rest-pose gate are unchanged.")
+    ap.add_argument("--mirror-fb", action="store_true",
+                    help="mirror the motion front↔back only (keeps left/right): mapping.mirror_forward")
+    ap.add_argument("--mirror-lr", action="store_true",
+                    help="mirror the motion left↔right only (keeps front/back): mapping.mirror_lateral")
     args = ap.parse_args()
 
     if sys.platform == "darwin":
@@ -57,6 +70,13 @@ def main() -> int:
         hw["sides"] = [s.strip() for s in args.sides.split(",") if s.strip()]
     if args.no_hands:
         hw["use_hands"] = False
+    if args.swap_sides:
+        rig.setdefault("mapping", {})["swap_sides"] = True
+    if args.mirror_fb or args.mirror_lr:
+        m = rig.setdefault("mapping", {})
+        m["mirror_forward"] = bool(args.mirror_fb)
+        m["mirror_lateral"] = bool(args.mirror_lr)
+        print(f"[hw] mirror: front↔back={args.mirror_fb}  left↔right={args.mirror_lr}")
     print(f"[hw] arms: {hw.get('sides', ['left', 'right'])}  hands: {hw.get('use_hands', True)}  "
           f"(rig hardware.sides / --sides; rest-pose gate ±"
           f"{float(hw.get('engage_pose_tol', 0.15)):.2f} rad)")
@@ -124,19 +144,35 @@ def main() -> int:
     src.start()
     recorder = SessionRecorder() if args.record else None
     push_calib = hasattr(src, "set_calib")   # in-headset calibration countdown (Vuer)
+    hw_sink = getattr(sink, "hw", sink)       # the HardwareSink under the render tee
+    TELEMETRY_PATH.parent.mkdir(exist_ok=True)
+    last_telem = 0.0
+    if rig.get("mapping", {}).get("swap_sides"):
+        print("[hw] swap_sides ON: right arm does the LEFT hand's motion (and vice versa)")
 
     period = 1.0 / hz
     try:
         while True:
             t = time.monotonic()   # shared clock with source stamps + supervisor staleness
             frame = src.latest()
-            engaged = supervisor.update(frame, t)
+            engaged = supervisor.update(frame, t)   # swap_sides applied inside engine.tick
             if recorder is not None and frame is not None:
                 recorder.add(frame, engaged, t)
             engine.tick(frame, engaged, t)
             if render is not None:
                 try:
                     render.publish(engine, frame, engaged, 1.0 / period, t)
+                except Exception:
+                    pass
+            # Motor health → file the dashboard polls (temp/effort/measured), ~5 Hz.
+            if hasattr(hw_sink, "telemetry") and t - last_telem > 0.2:
+                last_telem = t
+                try:
+                    TELEMETRY_PATH.write_text(json.dumps({
+                        "wall": time.time(),
+                        "engaged": {s: bool(engaged.get(s, False)) for s in engaged},
+                        "arms": hw_sink.telemetry(),
+                    }))
                 except Exception:
                     pass
             if push_calib:

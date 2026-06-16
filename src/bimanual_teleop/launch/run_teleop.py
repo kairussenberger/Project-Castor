@@ -72,11 +72,24 @@ def main() -> int:
     ap.add_argument("--viz-save", metavar="PATH", default=None,
                     help="log the same Rerun scene to a .rrd file instead of opening the viewer "
                          "(inspect later with `rerun PATH`)")
+    ap.add_argument("--swap-sides", action="store_true",
+                    help="drive each recorded hand with the OPPOSITE arm (right arm does the "
+                         "left hand's motion and vice versa)")
+    ap.add_argument("--mirror-fb", action="store_true",
+                    help="mirror motion front↔back only (mapping.mirror_forward)")
+    ap.add_argument("--mirror-lr", action="store_true",
+                    help="mirror motion left↔right only (mapping.mirror_lateral)")
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
 
     rig = load_rig()
     rig.setdefault("vr", {})["transport"] = args.vr
+    if args.swap_sides:
+        rig.setdefault("mapping", {})["swap_sides"] = True
+    if args.mirror_fb or args.mirror_lr:
+        m = rig.setdefault("mapping", {})
+        m["mirror_forward"] = bool(args.mirror_fb)
+        m["mirror_lateral"] = bool(args.mirror_lr)
     if args.calib_seconds is not None:
         rig["vr"]["calib_seconds"] = max(0.0, float(args.calib_seconds))
     if args.debug:
@@ -152,7 +165,7 @@ def main() -> int:
                 rate.update(t - _t_prev)
             _t_prev = t
             frame = src.latest()
-            engaged = supervisor.update(frame, t)
+            engaged = supervisor.update(frame, t)   # swap_sides applied inside engine.tick
             if recorder is not None and frame is not None:
                 recorder.add(frame, engaged, t)
             engine.tick(frame, engaged, t)

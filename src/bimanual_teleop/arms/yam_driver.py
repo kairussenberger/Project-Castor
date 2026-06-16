@@ -43,10 +43,10 @@ class YamArm:
     in MODEL space (rig.yaml convention) — the JointMap crosses the boundary."""
 
     def __init__(self, channel: str, joint_map: JointMap | None = None, *,
-                 require_map: bool = True, model_limits=None):
+                 require_map: bool = True, model_limits=None, wrap_ref=None):
         try:
             from .yam_chain import YamChain
-            self.chain = YamChain(channel)
+            self.chain = YamChain(channel, wrap_ref=wrap_ref)
         except ImportError as e:  # pragma: no cover - hardware only
             raise RuntimeError(
                 "i2rt SDK not installed. Real YAM control is Linux/SocketCAN only — "
@@ -78,6 +78,18 @@ class YamArm:
         if self.map is None:
             raise RuntimeError(f"YamArm({self.channel}): state() needs the joint map (hw_bringup)")
         return self.map.to_model(self.state_motor())
+
+    def telemetry(self) -> dict:
+        """Latest motor health for live monitoring: per-joint case temperature (°C),
+        effort (Nm), and measured pose (deg, model space). Reads the latest cached
+        motor-state frame (the chain's receive thread streams it) — cheap to poll."""
+        pos, vel, eff, temp = self.chain.read()
+        measured = self.map.to_model(pos[:6]) if self.map is not None else pos[:6]
+        return {
+            "temp": [float(x) for x in temp[:6]],
+            "eff": [float(x) for x in eff[:6]],
+            "measured_deg": [float(np.degrees(x)) for x in measured[:6]],
+        }
 
     # ---- commands ---------------------------------------------------------- #
     def command(self, q) -> None:

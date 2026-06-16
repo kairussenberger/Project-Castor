@@ -228,9 +228,12 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>bimanual-teleo
  <span class=chip id=age>age —</span>
 </header>
 <div class=ctrlbar>
- <button id=btnLive class="btn live">&#9654; START LIVE</button>
+ <button id=btnCanUp class="btn ghost" title="bring up the CAN buses (sudo ip link set canN up type can bitrate 1000000). Needs passwordless sudo for ip, else run it in a terminal.">&#8593; CAN UP</button>
+ <button id=btnLive class="btn live" title="LIVE Quest → dashboard/sim only (no robot)">&#9654; START LIVE</button>
+ <button id=btnLiveHw class="btn kill" title="LIVE Quest teleop driving the REAL ROBOT (run_hw --vr orbit, gesture clutch — arms follow only while you pinch, rate-limited). Arms at rest, ORBIT app running on the Quest, e-stop in hand.">&#9654; QUEST LIVE TELEOP</button>
  <button id=btnCalib class="btn cal">&#8853; CALIBRATE</button>
  <button id=btnCalClear class="btn ghost sm" title="clear the applied neutral-pose fit (back to 1:1)" style="display:none">clear cal</button>
+ <button id=btnHome class="btn cal" title="Drive the wired arms to the HOME / rest pose (rate-limited) and re-anchor the rest calibration. Arms MOVE — clear of people, e-stop in hand.">&#8962; RETURN HOME</button>
  <span style="width:6px"></span>
  <button id=btnStop class="btn stop" title="graceful stop of the dashboard's render engine (saves its recording)">&#9632; STOP</button>
  <button id=btnKill class="btn kill" title="SIGINT every teleop / jog / bring-up / replay process on this host — clean torque release. NOT a substitute for the physical e-stop.">&#9888; STOP ALL</button>
@@ -245,7 +248,11 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>bimanual-teleo
  <label class=meta>speed <input id=spd class=slider type=range min=10 max=100 value=100 step=5></label>
  <span id=spdLbl class=meta style="width:30px;display:inline-block;font-weight:700;color:#bcd0e6">1.0&times;</span>
  <label class=meta><input type=checkbox id=chkLoop checked> loop</label>
+ <label class=meta title="swap which ARM does which hand's motion: right arm does the left hand's movement and vice versa"><input type=checkbox id=chkSwap> swap arms</label>
+ <label class=meta title="mirror motion left↔right only (keeps front/back)"><input type=checkbox id=chkMlr> ↔L/R</label>
+ <label class=meta title="mirror motion front↔back only (keeps left/right)"><input type=checkbox id=chkMfb> ↔F/B</label>
  <button id=btnReplay class="btn play sm" title="preview on the dashboard — render only, no robot">&#9654; PREVIEW</button>
+ <button id=btnRobot class="btn kill sm" title="DRIVE THE REAL ARMS with this recording (run_hw, both arms, rate-limited). Arms at rest, e-stop in hand.">&#9654; RUN ON ROBOT</button>
  <button id=btnAnalyze class="btn ghost sm" title="grade this recording against the mapping contracts (no robot)">analyze</button>
  <span id=anaOut class=meta></span>
  <span style="flex:1"></span>
@@ -254,6 +261,14 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>bimanual-teleo
 <div id=metalRow class=ctrlbar style="display:none;padding-top:0">
  <code id=metalCmd class=mono style="flex:1;white-space:nowrap;overflow:auto"></code>
  <button id=btnCopyMetal class="btn ghost sm">copy</button>
+</div>
+<div class=ctrlbar id=calibBar style="flex-wrap:wrap;gap:6px">
+ <span class=meta style="font-weight:700;color:#9fb2c8;letter-spacing:.3px" title="set the L/R arm placement and each joint's motor direction by hand — no terminal">CALIBRATE</span>
+ <button id=btnJog class="btn kill sm" title="JOG mode: ENERGIZE + hold the arms so the −10/+10 buttons move the real motors. Arms at rest, e-stop in hand.">&#9654; JOG hw</button>
+ <button id=btnReanchor class="btn cal sm" title="capture the arms' CURRENT limp hang as the rest pose — NO motion. Fixes RETURN HOME / the engage gate after a channel swap. Arms must be hanging at rest.">&#8962; RE-ANCHOR REST</button>
+ <button id=btnSwapCh class="btn ghost sm" title="swap which CAN bus is the LEFT vs RIGHT arm (arm placement). Edits rig.yaml; RE-ANCHOR after.">swap L/R arms</button>
+ <span class=meta style="color:#76808d">— jog ±10° to see direction; the sign button flips a joint that moves the wrong way</span>
+ <span id=calibBody class=meta style="display:flex;flex-wrap:wrap;align-items:center;gap:4px;width:100%;margin-top:4px"></span>
 </div>
 <div id=calBanner style="display:none;padding:12px 16px;background:#2b2410;border-bottom:2px solid #d4af37;align-items:center;gap:14px">
  <span style="font-size:20px">&#129337;</span>
@@ -283,6 +298,16 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>bimanual-teleo
   <div class=panel id=cardL></div>
  </div>
 </main>
+<div class=panel id=logPanel style="margin:0 14px 14px">
+ <div class=ptitle style="display:flex;align-items:center;gap:10px">LIVE LOG
+  <span style="flex:1">— out/engine.log · faults, gates, motor temps</span>
+  <span id=logHot class=chip style="display:none">⚠ MOTOR HOT</span>
+  <button id=btnCopyFail class="btn ghost sm" title="copy the most recent failure / traceback to the clipboard">copy failures</button>
+  <button id=btnCopyLog class="btn ghost sm" title="copy the full visible log">copy all</button>
+  <label class=meta style="margin-left:4px"><input type=checkbox id=chkFollow checked> follow</label>
+ </div>
+ <pre id=logBox class=mono style="margin:0;max-height:240px;overflow:auto;font-size:11.5px;line-height:1.45;white-space:pre-wrap;color:#aebac8"></pre>
+</div>
 <script>
 const $=id=>document.getElementById(id);
 const sub=(a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]], dotp=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
@@ -441,7 +466,21 @@ function card(side,s){
  const wp=a.wrist_pos||a.ee_pos;
  if(a.cmd_pos&&wp){const e=Math.hypot(...[0,1,2].map(k=>a.cmd_pos[k]-wp[k]));
   h+=`<div class=kv><span>wrist target gap</span><b class="${e<0.05?'err-ok':'err-bad'}">${(e*100).toFixed(1)} cm</b></div>`}
+ if(a.motor&&a.motor.temp){
+  const T=a.motor.temp,stale=a.motorAge>2.5;
+  const cells=T.map(v=>`<span style="color:${tempColor(v)}">${v.toFixed(0)}</span>`).join(' · ');
+  const mx=Math.max(...T);
+  h+=`<div class=kv><span>motor temp °C (j1–j6)${stale?' · stale':''}</span><b style="opacity:${stale?0.5:1}">${cells} <span style="color:${tempColor(mx)}">· max ${mx.toFixed(0)}</span></b></div>`}
+ if(a.motor&&a.motor.measured_deg){
+  // joint-by-joint motor check: MEASURED angle vs COMMANDED. A joint that moves the
+  // WRONG way (sign/orientation error) shows a big red gap that grows as it moves.
+  const md=a.motor.measured_deg, cmd=a.q.map(v=>v*57.2958), stale=a.motorAge>2.5;
+  const cells=md.map((v,i)=>{const d=v-cmd[i];return `<span style="color:${Math.abs(d)>15?'#ff6b6b':'#9fb2c8'}">${v.toFixed(0)}</span>`}).join(' · ');
+  h+=`<div class=kv><span>motor measured ° (vs cmd)${stale?' · stale':''}</span><b style="opacity:${stale?0.5:1}">${cells}</b></div>`}
  return h}
+const TEMP_WARN=58,TEMP_HOT=72;   // °C — tune to the DM motors' over-temp trip
+function tempColor(v){return v>=TEMP_HOT?'#ff6b6b':v>=TEMP_WARN?'#e8b339':'#41d98d'}
+function hottestTemp(s){let mx=null;if(s&&s.arms)for(const side of['left','right']){const m=s.arms[side]&&s.arms[side].motor;if(m&&m.temp)mx=Math.max(mx==null?-99:mx,...m.temp)}return mx}
 function chip(id,cls,txt){const e=$(id);e.className='chip '+cls;e.textContent=txt}
 async function control(params){try{const r=await fetch('/control?'+new URLSearchParams(params));updCtrl(await r.json())}catch(e){}}
 let CTRL=null;
@@ -449,7 +488,7 @@ const speed=()=>$('spd').value/100;
 function metalCmd(){
  const f=$('selRec').value; if(!f){$('metalCmd').textContent='— pick a recording —';return}
  const sp=speed(), s=sp<1?` --speed ${sp.toFixed(2)}`:'';
- $('metalCmd').textContent=`python -m bimanual_teleop.launch.run_hw --vr replay ${f} --clutch recorded${s} --rate-limit 0.5`;
+ $('metalCmd').textContent=`python -m bimanual_teleop.launch.run_hw --vr replay ${f} --clutch recorded${s} --rate-limit 1.0`;
 }
 async function refreshRec(){
  const f=$('selRec').value, m=$('recMeta');
@@ -478,11 +517,45 @@ function updCtrl(c){
   refreshRec();
  }
 }
+$('btnCanUp').onclick=()=>control({action:'can_up'});
+function renderCalib(c){
+ if(!c)return; let h='';
+ for(const side of ['left','right']){
+  const ch=c.channels[side], sg=c.signs[side];
+  h+=`<b style="color:${side==='left'?'var(--blue)':'var(--orange)'};width:100%">${side.toUpperCase()} (${ch})</b>`;
+  for(let j=0;j<6;j++){
+   const sign=sg?(sg[j]>0?'+':'−'):'?';
+   h+=`<span style="white-space:nowrap;margin-right:6px"><span style="color:var(--dim)">j${j+1}</span>`
+     +`<button class="btn ghost sm" style="padding:0 4px;margin-left:2px" onclick="jog('${side}',${j},-10)" title="jog j${j+1} −10° on the real arm">−10</button>`
+     +`<button class="btn ghost sm" style="padding:0 4px" onclick="jog('${side}',${j},10)" title="jog j${j+1} +10°">+10</button>`
+     +`<button class="btn ghost sm" style="padding:0 5px;font-weight:700" onclick="flipSign('${side}',${j})" title="flip j${j+1} direction (use if it jogs the wrong way)">${sign}</button></span>`;
+  }
+ }
+ $('calibBody').innerHTML=h;
+}
+async function flipSign(side,j){try{const r=await(await fetch('/control?'+new URLSearchParams({action:'flip_sign',side,j}))).json();updCtrl(r);renderCalib(r.calib)}catch(e){}}
+async function jog(side,j,deg){try{updCtrl(await(await fetch('/control?'+new URLSearchParams({action:'jog',side,j,deg}))).json())}catch(e){}}
+$('btnJog').onclick=()=>{if(!confirm(`Start JOG mode?\n\nThe arms ENERGIZE and hold at rest; the −10/+10 buttons then MOVE the real motors (15°/s, soft-limit clamped).\n\n• Both arms at the resting pose\n• Hand on the e-stop\n\nUse STOP / STOP ALL to release torque.`))return; control({action:'start_jog'})};
+$('btnReanchor').onclick=()=>{if(!confirm(`RE-ANCHOR REST?\n\nNo motion — this captures the arms' CURRENT hang as the rest pose and fixes RETURN HOME / the engage gate after a channel swap.\n\n• Both arms hanging LIMP at the official rest\n• Nobody touching them`))return; control({action:'reanchor_rest'})};
+$('btnSwapCh').onclick=async()=>{if(!confirm(`Swap which CAN bus is the LEFT vs RIGHT arm?\n\nEdits rig.yaml (reversible). Then press RETURN HOME to re-anchor before running.`))return;
+ try{const r=await(await fetch('/control?action=swap_channels')).json();updCtrl(r);renderCalib(r.calib)}catch(e){}};
+(async()=>{try{const r=await(await fetch('/control?action=get_calib')).json();renderCalib(r.calib)}catch(e){}})();
 $('btnLive').onclick=()=>control({action:'start_live'});
+$('btnLiveHw').onclick=()=>{
+ if(!confirm(`⚠ LIVE QUEST TELEOP ON THE REAL ROBOT?\n\nThe arms will follow your Quest hand motion in real time — GESTURE clutch, so they move only while you PINCH (rate-limited 0.5 rad/s, both arms).\n\n• Both arms at the resting pose to start\n• ORBIT app running on the Quest, headset on\n• Hand on the e-stop, area clear of people\n\nUse STOP / STOP ALL to release torque.`)) return;
+ control({action:'start_live_hw'})};
 $('btnStop').onclick=()=>control({action:'stop'});
 $('btnKill').onclick=()=>control({action:'kill_all'});
+$('btnHome').onclick=()=>{
+ if(!confirm(`⌂ RETURN HOME?\n\nThe wired arms will MOVE (rate-limited) to the home/rest pose, then re-anchor the rest calibration so the next robot run can engage.\n\n• Area clear of people\n• Hand on the e-stop\n\nUse STOP / STOP ALL to release torque.`)) return;
+ control({action:'return_home'})};
 $('btnReplay').onclick=()=>{const f=$('selRec').value;
- if(f)control({action:'start_replay',file:f,loop:$('chkLoop').checked?'1':'0',speed:speed().toFixed(2)})};
+ if(f)control({action:'start_replay',file:f,loop:$('chkLoop').checked?'1':'0',speed:speed().toFixed(2),swap:$('chkSwap').checked?'1':'0',mfb:$('chkMfb').checked?'1':'0',mlr:$('chkMlr').checked?'1':'0'})};
+$('btnRobot').onclick=()=>{const f=$('selRec').value; if(!f)return;
+ const sp=speed().toFixed(2), sw=$('chkSwap').checked, fb=$('chkMfb').checked, lr=$('chkMlr').checked;
+ const tags=(sw?' ⇄arms':'')+(fb?' ↔F/B':'')+(lr?' ↔L/R':'');
+ if(!confirm(`⚠ DRIVE THE REAL ROBOT?\n\nRun "${f.split('/').pop()}" on the ACTUAL arms at ${sp}×${tags} (rate-limited 1.0 rad/s, both arms).\n\n• Both arms must be at the resting pose\n• Hand on the e-stop, area clear of people\n\nStarts IDLE, engages via the recorded clutch. Use STOP / STOP ALL to release torque.`)) return;
+ control({action:'start_replay_hw',file:f,speed:sp,swap:sw?'1':'0',mfb:fb?'1':'0',mlr:lr?'1':'0'})};
 $('selRec').onchange=refreshRec;
 $('spd').oninput=()=>{$('spdLbl').innerHTML=speed().toFixed(1)+'&times;';metalCmd()};
 $('btnMetal').onclick=()=>{const r=$('metalRow');r.style.display=r.style.display==='none'?'flex':'none';metalCmd()};
@@ -544,6 +617,12 @@ async function tick(){
   chip('age',d.age!=null&&d.age<0.3?'ok':'warn','age '+(d.age==null?'—':d.age.toFixed(2)+'s'));
   $('hint').textContent=hint(d);
   const s=d.state;
+  if(s&&s.arms&&d.hwtelem&&d.hwtelem.arms){
+   for(const side of['left','right'])if(s.arms[side]&&d.hwtelem.arms[side]){
+    s.arms[side].motor=d.hwtelem.arms[side];s.arms[side].motorAge=d.hwtelem.age}}
+  {const mx=hottestTemp(s),hot=mx!=null&&mx>=TEMP_HOT,fresh=d.hwtelem&&d.hwtelem.age<2.5;
+   const el=$('logHot');el.style.display=(hot&&fresh)?'inline-block':'none';
+   if(hot&&fresh){el.className='chip bad';el.textContent=`⚠ MOTOR ${mx.toFixed(0)}°C — STOP`}}
   if(s&&s.status&&d.connected){
    chip('hz',s.status.hz>30?'ok':'warn',(s.status.hz||0).toFixed(0)+' Hz');
    for(const[side,id]of[['left','L'],['right','R']]){
@@ -557,7 +636,29 @@ async function tick(){
  }catch(e){chip('conn','bad','dashboard error')}
  requestAnimationFrame(()=>setTimeout(tick,50));
 }
-tick();
+function escHtml(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;')}
+function colorLog(t){return t.split('\\n').map(ln=>{const l=ln.toLowerCase(),e=escHtml(ln);
+ if(l.includes('error')||l.includes('traceback')||l.includes('fail')||l.includes('over temperature')||l.includes('exceeds')||l.includes('raise '))return `<span style="color:#ff8a8a">${e}</span>`;
+ if(l.includes('warning')||l.includes('⚠'))return `<span style="color:#e8b339">${e}</span>`;
+ if(l.includes('✓')||l.includes('re-anchored')||l.includes('within ±')||l.includes(' running'))return `<span style="color:#41d98d">${e}</span>`;
+ if(l.includes('=====')||l.includes('dashboard spawn'))return `<span style="color:#6f9fe8">${e}</span>`;
+ return e}).join('\\n')}
+async function pollLog(){
+ try{const r=await(await fetch('/logs?n=200')).json(),box=$('logBox');
+  const atEnd=box.scrollTop+box.clientHeight>=box.scrollHeight-30;
+  box.innerHTML=colorLog(r.text||'');
+  if($('chkFollow').checked||atEnd)box.scrollTop=box.scrollHeight;
+ }catch(e){}
+ setTimeout(pollLog,1500);
+}
+async function copyLog(fail){const btn=$(fail?'btnCopyFail':'btnCopyLog'),label=btn.textContent;
+ try{const r=await(await fetch('/logs?n=600'+(fail?'&fail=1':''))).json();
+  await navigator.clipboard.writeText(r.text||'(nothing to copy)');
+  btn.textContent='copied ✓';setTimeout(()=>btn.textContent=label,1200);
+ }catch(e){btn.textContent='copy failed';setTimeout(()=>btn.textContent=label,1200)}}
+$('btnCopyFail').onclick=()=>copyLog(true);
+$('btnCopyLog').onclick=()=>copyLog(false);
+tick();pollLog();
 </script></body></html>"""
 
 
@@ -591,6 +692,48 @@ def analyze_recording(path: Path) -> dict:
     if not verdict:
         return {"error": "no verdict — see out/engine.log"}
     return {"ok": "PASS" in verdict, "verdict": verdict, "detail": out[-1500:]}
+
+
+def read_hw_telemetry() -> dict | None:
+    """Latest motor health (temp/effort/measured) written by run_hw, with age.
+    None when no hardware run has published it. `age` (s) lets the page grey out
+    stale readings after a process exits."""
+    p = REPO_ROOT / "out" / "hw_telemetry.json"
+    try:
+        if not p.exists():
+            return None
+        d = json.loads(p.read_text())
+        d["age"] = max(0.0, time.time() - float(d.get("wall", 0.0)))
+        return d
+    except Exception:
+        return None
+
+
+def read_engine_log(n: int = 160, fail_only: bool = False) -> dict:
+    """Tail of out/engine.log for the live log panel. fail_only returns the most
+    recent failure block (from just before the last error/traceback to the end) so
+    the operator can copy a coherent crash report with one button."""
+    p = REPO_ROOT / "out" / "engine.log"
+    try:
+        if not p.exists():
+            return {"text": "(no engine.log yet — start a robot/replay run)", "lines": 0}
+        with open(p, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - 300_000))
+            lines = fh.read().decode("utf-8", "replace").splitlines()
+    except Exception as e:
+        return {"text": f"(log read error: {e})", "lines": 0}
+    if fail_only:
+        marks = ("traceback", "error", "runtimeerror", "exception", "failed",
+                 "gate failed", "over temperature", "exceeds", "estop", "e-stop")
+        idx = next((i for i in range(len(lines) - 1, -1, -1)
+                    if any(m in lines[i].lower() for m in marks)), None)
+        if idx is None:
+            return {"text": "(no failures in the recent log)", "lines": 0}
+        start = max(0, idx - 4)
+        return {"text": "\n".join(lines[start:]), "lines": len(lines) - start}
+    return {"text": "\n".join(lines[-n:]), "lines": min(n, len(lines))}
 
 
 def rig_info() -> dict:
@@ -664,9 +807,16 @@ class EngineManager:
 
     @classmethod
     def _busy_ports(cls):
+        # Probe with SO_REUSEADDR, exactly how the engine's servers bind (e.g.
+        # render_sink.py:141). Without it the probe counts TIME_WAIT sockets —
+        # left from the dashboard's own client connections to 8102 — as "busy",
+        # so _kill_strays waited out a port the new engine could already rebind.
+        # SO_REUSEADDR still fails on a genuinely LISTENing socket, so a truly
+        # live engine is still detected; only the false TIME_WAIT wait is removed.
         busy = []
         for p in cls.ENGINE_PORTS:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 s.bind(("127.0.0.1", p))
             except OSError:
@@ -698,25 +848,35 @@ class EngineManager:
             busy = self._busy_ports()
         return busy
 
-    def _spawn(self, args, mode, record):
+    def _spawn(self, args, mode, record, module="bimanual_teleop.launch.run_teleop",
+               ready_timeout=8.0, wait_render=True, script=None):
         (REPO_ROOT / "out").mkdir(exist_ok=True)
         log_path = REPO_ROOT / "out" / "engine.log"
         log = open(log_path, "ab")
         log.write(f"\n===== {time.strftime('%H:%M:%S')} dashboard spawn: {mode} =====\n".encode())
         log.flush()
         scan_from = log_path.stat().st_size
-        self.proc = subprocess.Popen([_sys.executable, "-m", "bimanual_teleop.launch.run_teleop", *args],
-                                     cwd=REPO_ROOT, stdout=log, stderr=subprocess.STDOUT)
+        argv = [_sys.executable, script, *args] if script else [_sys.executable, "-m", module, *args]
+        self.proc = subprocess.Popen(argv, cwd=REPO_ROOT, stdout=log, stderr=subprocess.STDOUT)
         log.close()
         self.mode, self.record, self.t0 = mode, record, time.time()
-        # Health gate: "running" only once the render JSON port answers (that is
-        # the stream this dashboard draws from). EADDRINUSE in the log or an
-        # early exit means a husk — reap it and put the reason on the button row.
+        # Health gate. Render/hardware engines are "running" once the render JSON
+        # port answers (the stream this dashboard draws from). A TRANSIENT job
+        # (wait_render=False, e.g. return-home) has no render port: it is "running"
+        # once it survives a short early-crash window, and a clean exit (code 0) is
+        # success. EADDRINUSE or an early non-zero exit means a husk — reap it and
+        # put the reason on the button row.
         err = None
-        deadline = time.time() + 8.0
+        deadline = time.time() + ready_timeout
         while time.time() < deadline:
             if self.proc.poll() is not None:
-                err = f"engine exited at startup (code {self.proc.returncode}) — see out/engine.log"
+                code = self.proc.returncode
+                if not wait_render and code == 0:
+                    self.proc, self.mode, self.record, self.t0 = None, None, None, None
+                    self.last_msg = f"{mode} — done"
+                    return
+                kind = "job" if not wait_render else "engine"
+                err = f"{kind} exited at startup (code {code}) — see out/engine.log"
                 break
             with open(log_path, "rb") as fh:
                 fh.seek(scan_from)
@@ -724,14 +884,21 @@ class EngineManager:
             if b"Address already in use" in tail:
                 err = "port conflict at startup — an old engine survived; press the button again"
                 break
-            try:
-                socket.create_connection(("127.0.0.1", 8102), timeout=0.3).close()
+            if wait_render:
+                try:
+                    socket.create_connection(("127.0.0.1", 8102), timeout=0.3).close()
+                    self.last_msg = f"{mode} running"
+                    return
+                except OSError:
+                    time.sleep(0.3)
+            elif time.time() - self.t0 > 2.5:   # transient: survived the early-crash window
                 self.last_msg = f"{mode} running"
                 return
-            except OSError:
+            else:
                 time.sleep(0.3)
         if err is None:
-            err = "render port 8102 never came up — see out/engine.log"
+            err = ("job did not start in time — see out/engine.log" if not wait_render
+                   else "render port 8102 never came up — see out/engine.log")
         if self.proc.poll() is None:
             self.proc.send_signal(signal.SIGINT)
             try:
@@ -741,7 +908,8 @@ class EngineManager:
         self.proc, self.mode, self.record, self.t0 = None, None, None, None
         self.last_msg = f"FAILED: {err}"
 
-    def _start(self, args, mode, record):
+    def _start(self, args, mode, record, module="bimanual_teleop.launch.run_teleop",
+               ready_timeout=8.0, wait_render=True, script=None):
         with self._lock:
             self._stop_inner()
             busy = self._kill_strays()
@@ -749,23 +917,177 @@ class EngineManager:
                 self.last_msg = (f"FAILED: ports {busy} still busy after killing strays — "
                                  "wait a few seconds and press again")
                 return self.status()
-            self._spawn(args, mode, record)
+            self._spawn(args, mode, record, module, ready_timeout, wait_render, script)
             return self.status()
+
+    def return_home(self, side=None):
+        """Drive the wired arms to HOME and re-anchor rest (launch.return_home).
+        Transient job: no render stream, so wait_render=False. STOP / STOP ALL
+        SIGINT it → its chain teardown releases torque."""
+        args = ["--side", side] if side in ("left", "right") else []
+        label = "RETURN HOME" + (f" {side}" if side in ("left", "right") else "")
+        return self._start(args, label, None, module="bimanual_teleop.launch.return_home",
+                           ready_timeout=12.0, wait_render=False)
+
+    def reanchor_rest(self):
+        """Capture the arms' CURRENT limp hang as the rest pose — NO motion. Fixes the
+        engage gate + RETURN HOME target after a channel swap or drift. Arms must be
+        hanging at rest. Transient job (launch.return_home --anchor-only)."""
+        return self._start(["--anchor-only"], "RE-ANCHOR REST", None,
+                           module="bimanual_teleop.launch.return_home",
+                           ready_timeout=12.0, wait_render=False)
+
+    def can_up(self):
+        """Bring up the rig's CAN buses (SocketCAN) at 1 Mbit. Needs sudo — works
+        without a prompt only if passwordless sudo is set for `ip`; otherwise reports
+        the error so the operator runs it in a terminal."""
+        rig = load_rig()
+        chans = sorted({rig["arms"][s]["can_channel"] for s in ("left", "right")})
+        out = []
+        for ch in chans:
+            r = subprocess.run(["sudo", "-n", "ip", "link", "set", ch, "up", "type", "can",
+                                "bitrate", "1000000"], capture_output=True, text=True)
+            state = subprocess.run(["ip", "-br", "link", "show", ch], capture_output=True, text=True).stdout.strip()
+            ok = " up " in f" {state.lower()} "
+            out.append(f"{ch}: {'UP ✓' if ok else 'FAILED'}" + ("" if ok else f" — {(r.stderr or 'sudo needed; run in a terminal').strip()[:80]}"))
+        self.last_msg = "CAN " + " | ".join(out)
+        return self.status()
+
+    # --- by-hand calibration from the dashboard (arm L/R placement + joint orientation) ---
+    def _calib_state(self) -> dict:
+        """Current per-side CAN channel + joint signs, for the calibration panel."""
+        from bimanual_teleop.arms.joint_map import load_joint_map, map_file_from_rig
+        rig = load_rig(); mf = map_file_from_rig(rig)
+        out = {"channels": {}, "signs": {}}
+        for s in ("left", "right"):
+            out["channels"][s] = rig["arms"][s]["can_channel"]
+            jm = load_joint_map(mf, s)
+            out["signs"][s] = [int(x) for x in jm.signs] if jm is not None else None
+        return out
+
+    def swap_channels(self):
+        """Swap which CAN bus is left vs right (arm L/R placement), editing only the
+        two can_channel values in rig.yaml so all comments survive. Re-home after."""
+        import re
+        p = REPO_ROOT / "config" / "rig.yaml"
+        lines = p.read_text().split("\n")
+        idx = [i for i, l in enumerate(lines) if re.match(r"\s*can_channel:\s*\S", l)]
+        if len(idx) != 2:
+            self.last_msg = f"CAN swap failed: found {len(idx)} can_channel lines (expected 2)"
+            return {**self.status(), "calib": self._calib_state()}
+        ch = [re.search(r"can_channel:\s*(\S+)", lines[i]).group(1) for i in idx]
+        lines[idx[0]] = re.sub(r"(can_channel:\s*)\S+", r"\g<1>" + ch[1], lines[idx[0]], count=1)
+        lines[idx[1]] = re.sub(r"(can_channel:\s*)\S+", r"\g<1>" + ch[0], lines[idx[1]], count=1)
+        p.write_text("\n".join(lines))
+        self.last_msg = f"CAN L/R swapped → left={ch[1]} right={ch[0]} · RETURN HOME to re-anchor"
+        return {**self.status(), "calib": self._calib_state()}
+
+    def flip_sign(self, side: str, j: int):
+        """Flip joint j's motor direction (orientation) and re-anchor the offset at the
+        stored rest, so the rest-pose gate still passes. Use when a joint jogs the
+        WRONG way vs the dashboard."""
+        from bimanual_teleop.arms.joint_map import (JointMap, load_joint_map,
+                                                    map_file_from_rig, save_joint_map)
+        if side not in ("left", "right") or not (0 <= j < 6):
+            self.last_msg = "flip_sign: bad side/joint"
+            return {**self.status(), "calib": self._calib_state()}
+        rig = load_rig(); mf = map_file_from_rig(rig)
+        jm = load_joint_map(mf, side)
+        if jm is None:
+            self.last_msg = f"{side}: no joint map to edit (run a bring-up first)"
+            return {**self.status(), "calib": self._calib_state()}
+        doc = json.loads(mf.read_text())[side]
+        qmr = doc.get("q_motor_rest")
+        if qmr is None:
+            self.last_msg = f"{side}: map has no q_motor_rest — RETURN HOME first to anchor"
+            return {**self.status(), "calib": self._calib_state()}
+        signs = jm.signs.copy(); signs[j] *= -1
+        neutral = rig["arms"][side]["neutral_q"]
+        jm2 = JointMap.anchored_at_rest(signs, qmr, neutral)
+        save_joint_map(mf, side, jm2, channel=doc.get("channel", rig["arms"][side]["can_channel"]),
+                       q_motor_rest=qmr)
+        self.last_msg = f"{side} j{j + 1} orientation flipped → sign {int(signs[j]):+d}"
+        return {**self.status(), "calib": self._calib_state()}
+
+    def start_jog(self):
+        """JOG mode: hold the arms and accept per-joint nudges (the −10/+10 buttons).
+        Same rest-pose gate as a robot run; STOP / STOP ALL releases torque."""
+        return self._start(["--sink", "hw", "--max-deg-s", "15", "--server"], "JOG (hw)", None,
+                           script="scripts/jog_arms.py", ready_timeout=20.0)
+
+    def jog(self, side, j, deg):
+        """Send one per-joint nudge to the running jog server (UDP 8202)."""
+        if side not in ("left", "right"):
+            return {**self.status(), "error": "jog: bad side"}
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.sendto(f"{side} {int(j)} {float(deg):g}".encode(), ("127.0.0.1", 8202))
+            s.close()
+            self.last_msg = f"jog {side} j{int(j) + 1} {float(deg):+.0f}° (needs JOG mode running)"
+        except Exception as e:
+            self.last_msg = f"jog failed: {e}"
+        return self.status()
 
     def start_live(self):
         rec = f"recordings/live_{time.strftime('%m%d_%H%M%S')}.npz"
         return self._start(["--vr", "orbit", "--clutch", "always", "--record", rec], "LIVE", rec)
 
-    def start_replay(self, file: str, loop: bool, speed: float = 1.0):
+    def start_live_hw(self):
+        """LIVE Quest → REAL ROBOT teleop (run_hw --vr orbit). GESTURE clutch: the
+        arms follow only while the operator pinches. Rate-limited; HardwareSink's
+        rest-pose gate applies at start (arms must be at rest); the session is
+        recorded. STOP / STOP ALL release torque (run_hw's finally)."""
+        rec = f"recordings/livehw_{time.strftime('%m%d_%H%M%S')}.npz"
+        return self._start(["--vr", "orbit", "--clutch", "gesture", "--rate-limit", "0.5",
+                            "--record", rec], "LIVE→ROBOT", rec,
+                           module="bimanual_teleop.launch.run_hw", ready_timeout=20.0)
+
+    def start_replay(self, file: str, loop: bool, speed: float = 1.0, swap: bool = False,
+                     mfb: bool = False, mlr: bool = False):
         args = ["--vr", "replay", file] + (["--loop"] if loop else [])
         if speed != 1.0:
             args += ["--speed", f"{speed:g}"]
+        if swap:
+            args += ["--swap-sides"]
+        if mfb:
+            args += ["--mirror-fb"]
+        if mlr:
+            args += ["--mirror-lr"]
         label = f"REPLAY {Path(file).name}"
         if speed != 1.0:
             label += f" @{speed:g}x"
         if loop:
             label += " (loop)"
+        if swap:
+            label += " ⇄arms"
+        if mfb:
+            label += " ↔FB"
+        if mlr:
+            label += " ↔LR"
         return self._start(args, label, None)
+
+    def start_replay_hw(self, file: str, speed: float = 0.25, swap: bool = False,
+                        mfb: bool = False, mlr: bool = False):
+        """DRIVE THE REAL ARMS with a recording (run_hw, not the render engine).
+        Always rate-limited and clutch=recorded; NO --loop (run_hw plays the
+        recording once, then PD-holds the last pose until STOP). HardwareSink's
+        rest-pose gate still applies: if the arms are not at the resting pose,
+        run_hw exits at startup and the button row shows the failure. STOP /
+        STOP ALL release torque (run_hw's finally block)."""
+        cap = float(load_rig().get("hardware", {}).get("replay_rate_limit", 1.0))
+        args = ["--vr", "replay", file, "--clutch", "recorded", "--rate-limit", f"{cap:g}"]
+        if speed != 1.0:
+            args += ["--speed", f"{speed:g}"]
+        if swap:
+            args += ["--swap-sides"]
+        if mfb:
+            args += ["--mirror-fb"]
+        if mlr:
+            args += ["--mirror-lr"]
+        label = (f"ROBOT {Path(file).name}" + (f" @{speed:g}x" if speed != 1.0 else "")
+                 + (" ⇄arms" if swap else "") + (" ↔FB" if mfb else "") + (" ↔LR" if mlr else ""))
+        return self._start(args, label, None,
+                           module="bimanual_teleop.launch.run_hw", ready_timeout=20.0)
 
     # STOP ALL targets: everything that can move metal or hold the CAN bus. The
     # dashboard's own render engine (run_teleop) is stopped gracefully first via
@@ -778,6 +1100,7 @@ class EngineManager:
         (r"scripts/probe_nudge\.py", "probe_nudge"),
         (r"scripts/test_pattern\.py", "test_pattern"),
         (r"bimanual_teleop\.launch\.run_hw", "run_hw"),
+        (r"bimanual_teleop\.launch\.return_home", "return_home"),
     )
 
     def _matches(self, pat):
@@ -856,8 +1179,33 @@ class EngineManager:
 
     def dispatch(self, query: dict):
         action = (query.get("action") or [""])[0]
+        if action == "can_up":
+            return self.can_up()
+        if action == "get_calib":
+            return {**self.status(), "calib": self._calib_state()}
+        if action == "swap_channels":
+            return self.swap_channels()
+        if action == "reanchor_rest":
+            return self.reanchor_rest()
+        if action == "start_jog":
+            return self.start_jog()
+        if action == "jog":
+            try:
+                return self.jog((query.get("side") or [""])[0], int((query.get("j") or ["-1"])[0]),
+                                float((query.get("deg") or ["0"])[0]))
+            except ValueError:
+                return {**self.status(), "error": "jog: bad params"}
+        if action == "flip_sign":
+            side = (query.get("side") or [""])[0]
+            try:
+                j = int((query.get("j") or ["-1"])[0])
+            except ValueError:
+                j = -1
+            return self.flip_sign(side, j)
         if action == "start_live":
             return self.start_live()
+        if action == "start_live_hw":
+            return self.start_live_hw()
         if action == "start_replay":
             f = (query.get("file") or [""])[0]
             if not f or not (REPO_ROOT / f).exists():
@@ -866,7 +1214,24 @@ class EngineManager:
                 sp = float((query.get("speed") or ["1"])[0])
             except ValueError:
                 sp = 1.0
-            return self.start_replay(f, (query.get("loop") or ["0"])[0] == "1", sp)
+            return self.start_replay(f, (query.get("loop") or ["0"])[0] == "1", sp,
+                                     (query.get("swap") or ["0"])[0] == "1",
+                                     (query.get("mfb") or ["0"])[0] == "1",
+                                     (query.get("mlr") or ["0"])[0] == "1")
+        if action == "start_replay_hw":
+            f = (query.get("file") or [""])[0]
+            if not f or not (REPO_ROOT / f).exists():
+                return {"error": f"no such recording: {f}", **self.status()}
+            try:
+                sp = float((query.get("speed") or ["0.25"])[0])
+            except ValueError:
+                sp = 0.25
+            return self.start_replay_hw(f, sp, (query.get("swap") or ["0"])[0] == "1",
+                                        (query.get("mfb") or ["0"])[0] == "1",
+                                        (query.get("mlr") or ["0"])[0] == "1")
+        if action == "return_home":
+            side = (query.get("side") or [""])[0] or None
+            return self.return_home(side)
         if action == "stop":
             return self.stop()
         if action == "kill_all":
@@ -927,7 +1292,14 @@ def make_server(feed: StateFeed, host: str, port: int, rig: dict | None = None,
                             snap["hand_mesh"] = meshes.hand_world(snap["state"])
                     except Exception:
                         snap["mesh_T"] = {}
+                snap["hwtelem"] = read_hw_telemetry()
                 body = json.dumps(snap).encode()
+                ctype = "application/json"
+            elif self.path.startswith("/logs"):
+                q = parse_qs(urlparse(self.path).query)
+                n = int((q.get("n") or ["160"])[0])
+                fail_only = (q.get("fail") or ["0"])[0] == "1"
+                body = json.dumps(read_engine_log(n, fail_only)).encode()
                 ctype = "application/json"
             elif self.path.startswith("/meshes"):
                 body = mesh_body

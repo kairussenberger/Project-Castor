@@ -115,8 +115,21 @@ def R_base_from_body(base_quat) -> np.ndarray:
     return quat_to_R(base_quat).T @ W_AXES
 
 
+def _mirror_body(mirror_forward: bool, mirror_lateral: bool) -> np.ndarray | None:
+    """Reflection M in body [right, up, forward] coords. mirror_forward negates the
+    FORWARD axis (front↔back); mirror_lateral negates the RIGHT axis (left↔right).
+    Position mirrors as M·p; orientation mirrors as M·R·M, which is the mirror-image
+    rotation and stays PROPER (det +1) even for a single-axis reflection — so the
+    absolute-orientation QP never sees an improper rotation. None = no mirror."""
+    if not (mirror_forward or mirror_lateral):
+        return None
+    return np.diag([-1.0 if mirror_lateral else 1.0, 1.0, -1.0 if mirror_forward else 1.0])
+
+
 def body_relative_hand_sample(hand: HandSample | None, head_mat: np.ndarray | None,
-                              torso_from_head=(0.0, -0.35, 0.0)) -> HandSample | None:
+                              torso_from_head=(0.0, -0.35, 0.0),
+                              mirror_forward: bool = False,
+                              mirror_lateral: bool = False) -> HandSample | None:
     """Return a copy of `hand` whose wrist pose is expressed relative to the current
     operator torso/body frame.
 
@@ -124,6 +137,8 @@ def body_relative_hand_sample(hand: HandSample | None, head_mat: np.ndarray | No
     roughly upper-torso/shoulder height below the headset. Translation becomes the
     vector from this torso proxy to the wrist in body axes. Rotation becomes wrist
     orientation in the same body axes.
+    `mirror_forward` / `mirror_lateral` reflect the motion about the frontal / sagittal
+    plane when the operator is observing the robot from a mirrored viewpoint.
     Landmarks are intentionally left unchanged because finger retargeting consumes
     their raw local hand geometry, not the arm-control wrist origin.
     """
@@ -141,6 +156,10 @@ def body_relative_hand_sample(hand: HandSample | None, head_mat: np.ndarray | No
     wrist = W.copy()
     wrist[:3, 3] = op_axes.T @ (W[:3, 3] - torso_world)
     wrist[:3, :3] = op_axes.T @ W[:3, :3]
+    M = _mirror_body(mirror_forward, mirror_lateral)
+    if M is not None:
+        wrist[:3, 3] = M @ wrist[:3, 3]
+        wrist[:3, :3] = M @ wrist[:3, :3] @ M
     return HandSample(tracked=hand.tracked, wrist=wrist, landmarks=hand.landmarks, pinch=hand.pinch)
 
 
