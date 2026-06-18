@@ -205,6 +205,22 @@ def main() -> int:
         print(f"[hw] dashboard mirror disabled ({e}) — hardware loop unaffected")
     engine = TeleopEngine(rig, sink)
     supervisor = Supervisor(rig, clutch)
+    # Engine control channel (dashboard CALIBRATE button → port 8201). REQUIRED for
+    # live transports: --vr orbit/vuer start with follow LOCKED until an IN-SESSION
+    # calibration completes (vr.require_calibration — the same gate run_teleop has).
+    # Without this the dashboard CALIBRATE button has nothing to talk to and the arms
+    # never unlock ("prompted to calibrate but the button does nothing"). Best-effort:
+    # a busy port must never block the hardware loop.
+    ctl = None
+    if args.vr in ("orbit", "vuer"):
+        ctl_port = int(rig.get("vr", {}).get("control_port", 8201))
+        try:
+            from ..control_server import ControlServer
+            ctl = ControlServer(engine, ctl_port)
+            print(f"[hw] engine control channel on {ctl.endpoint} — dashboard CALIBRATE works")
+        except OSError as e:
+            print(f"[hw] engine control channel disabled (port {ctl_port}): {e} — "
+                  "CALIBRATE button will not reach this process")
     src.start()
     recorder = SessionRecorder() if args.record else None
     push_calib = hasattr(src, "set_calib")   # in-headset calibration countdown (Vuer)
@@ -273,6 +289,8 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\nstopping — releasing torque")
     finally:
+        if ctl is not None:
+            ctl.close()
         supervisor.estop()
         src.stop()
         sink.close()
