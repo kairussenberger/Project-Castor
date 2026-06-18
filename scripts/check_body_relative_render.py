@@ -28,12 +28,16 @@ def pose(R, p) -> np.ndarray:
 
 
 def make_frame(head: np.ndarray, torso_from_head: np.ndarray,
-               torso_to_wrist: dict[str, np.ndarray], stamp: float) -> VRFrame:
-    op = head_op_axes(head)
+               torso_to_wrist: dict[str, np.ndarray], stamp: float,
+               ref_head: np.ndarray | None = None) -> VRFrame:
+    # Models the real ORBIT stream (see check_body_relative.py): wrist values
+    # ride the head POSITION but not its ROTATION; offsets defined in REF_HEAD's
+    # frame so head motion leaves the streamed hand values physically unchanged.
+    ref = head if ref_head is None else ref_head
+    op = head_op_axes(ref)
     hands = {}
     for side in SIDES:
-        # RIGID body motion: the hand carries the head's rotation (proper matrix).
-        wrist = pose(head[:3, :3], head[:3, 3] + op @ (torso_from_head + torso_to_wrist[side]))
+        wrist = pose(ref[:3, :3], head[:3, 3] + op @ (torso_from_head + torso_to_wrist[side]))
         hands[side] = HandSample(
             tracked=True,
             wrist=wrist,
@@ -91,13 +95,13 @@ def main() -> int:
         state_same = state0
         for i in range(480, 530):
             t = i / 120.0
-            state_same = build(engine, sink, make_frame(head_moved, torso, base_vec, t), engaged, t)
+            state_same = build(engine, sink, make_frame(head_moved, torso, base_vec, t, ref_head=head0), engaged, t)
         cmd_same = {side: cmd_pos(state_same, side) for side in SIDES}
 
         state_lift = state_same
         for i in range(530, 720):
             t = i / 120.0
-            state_lift = build(engine, sink, make_frame(head_moved, torso, lifted_vec, t), engaged, t)
+            state_lift = build(engine, sink, make_frame(head_moved, torso, lifted_vec, t, ref_head=head0), engaged, t)
         cmd_lift = {side: cmd_pos(state_lift, side) for side in SIDES}
 
         for side in SIDES:

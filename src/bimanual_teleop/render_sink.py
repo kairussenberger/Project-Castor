@@ -77,8 +77,10 @@ def _landmarks_body(hs, op_axes) -> list | None:
     return ((arr - arr[0]) @ op_axes).reshape(-1).tolist()
 
 
-def operator_debug_state(frame, torso_from_head) -> dict:
-    """Unity/debug overlay state: the body-frame torso→wrist vectors that drive IK."""
+def operator_debug_state(frame, torso_from_head, head_R_override=None) -> dict:
+    """Unity/debug overlay state: the body-frame torso→wrist vectors that drive
+    IK. `head_R_override` = the engine's locked yaw frame, so the display uses
+    exactly the frame arm control uses (head turns don't rotate the overlay)."""
     torso = _finite_vec3(torso_from_head, _DEFAULT_TORSO_FROM_HEAD)
     if frame is None:
         return {
@@ -91,6 +93,9 @@ def operator_debug_state(frame, torso_from_head) -> dict:
             },
         }
     head = _finite_mat4(getattr(frame, "head", None))
+    if head is not None and head_R_override is not None:
+        head = head.copy()
+        head[:3, :3] = np.asarray(head_R_override, dtype=float)
     if head is None:
         hands = {}
         for s in SIDES:
@@ -267,8 +272,13 @@ class RenderSink:
                 "cmd_pos": cmd_pos,
                 "cmd_quat": cmd_quat,
                 "margins": ac.ik.limit_margins(self._arm[s]).tolist(),
+                # Pre-clamp target excess outside the workspace box (m) —
+                # sustained values = the mapping/calibration is off (additive
+                # field; the dashboard turns it into the WS CLAMP indicator).
+                "clamp_dist": round(float(getattr(ac, "clamp_dist", 0.0)), 4),
             }
-        op_state = operator_debug_state(frame, self._torso_from_head)
+        op_state = operator_debug_state(frame, self._torso_from_head,
+                                        getattr(engine, "_yaw_R", None))
         if self._body_relative:
             tracked = {s: bool(op_state["hands"][s]["tracked"]) for s in SIDES}
         else:
@@ -283,6 +293,13 @@ class RenderSink:
             # Applied neutral-pose fit (additive schema field — Unity's
             # JsonUtility ignores unknown fields; the dashboard shows a chip).
             "calib_applied": getattr(engine, "calib_summary", None),
+            # SAFETY state: live transports hold the arms until an in-session
+            # calibration completes (additive field; Unity ignores it).
+            "follow_locked": bool(getattr(engine, "follow_locked", False)),
+            # Anchor-jump guard state (additive field): trips/holds/reason for
+            # the dashboard banner and post-session forensics.
+            "guard": (engine.guard.status()
+                      if getattr(engine, "guard", None) is not None else None),
             "hz": float(hz),
         }
         hand_render = {s: ordered_hand_state(self._hand[s]) for s in SIDES}

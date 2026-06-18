@@ -106,18 +106,44 @@ class ArmController:
         self._was_engaged = False
         self.cmd_R = None   # last commanded EE orientation (base frame) — for the on-screen viz
         self.cmd_pos = None  # last commanded EE position (base frame) after workspace/cross clamps
+        # Live calibration-health signal: how far the raw mapped target sat
+        # OUTSIDE the workspace box this tick (0 inside). Sustained large values
+        # mean the mapping is off — a stale/broken calibration pins targets at
+        # the box face (the 2026-06-11 failure mode), it never just "feels far".
+        self.clamp_dist = 0.0
         # --- motion guardrails (safety section) ------------------------------ #
-        # Target governor: world-frame caps on how fast the COMMANDED target may
-        # move/turn, plus teleport rejection. Real operator motion peaks ≈2 m/s;
-        # tracking glitches measured 58–65 m/s — anything implying more than
-        # target_jump_speed is NOT a movement: the mapper re-anchors and the arm
-        # GLIDES instead (the violent motion simply does not happen).
+        # Target governor: a critically-damped second-order TRACKER of the
+        # commanded target (position AND attitude), with world-frame velocity
+        # and ACCELERATION caps, plus teleport rejection. The old hard
+        # speed·dt clamp produced rectangle-velocity glides — instant jump to
+        # max speed, instant stop: "blocky". Bounding acceleration too makes
+        # every demand an S-curve (the classic smooth step response): velocity
+        # ramps in, cruises at the cap, and the critically-damped PD lands it
+        # without overshoot. All caps are per SECOND (integrated with real dt
+        # in stable sub-steps), so the governed motion is identical at any
+        # frame rate — what the sim shows is what the hardware does.
+        # Real operator motion peaks ≈2 m/s; tracking glitches measured
+        # 58–65 m/s — anything implying more than target_jump_speed is NOT a
+        # movement: the mapper re-anchors and the arm GLIDES instead (the
+        # violent motion simply does not happen).
         s = rig.get("safety", {})
         self.speed_max = float(s.get("target_speed_max", 0.8))        # m/s
+        self.accel_max = float(s.get("target_accel_max", 5.0))        # m/s²
         self.jump_speed = float(s.get("target_jump_speed", 3.0))      # m/s → reject
         self.ang_speed_max = float(s.get("target_ang_speed_max", 2.5))  # rad/s
-        self.ori_smooth_s = float(s.get("target_ori_smooth_s", 0.12))  # attitude low-pass τ
-        self._gov: dict | None = None       # previous governed target {p, R, t}
+        self.ang_accel_max = float(s.get("target_ang_accel_max", 25.0))  # rad/s²
+        # Tracker bandwidths (critically damped: kp = ω², kd = 2ω). Orientation
+        # keeps backward compat with the legacy first-order τ when no Hz key is
+        # set: ω = 2/τ roughly matches the old settle time.
+        hz_p = float(s.get("target_smooth_hz", 2.0))
+        tau = float(s.get("target_ori_smooth_s", 0.12))
+        hz_o = float(s.get("target_ori_smooth_hz",
+                           1.0 / (np.pi * tau) if tau > 0 else 2.5))
+        self._wp = 2.0 * np.pi * hz_p
+        self._wo = 2.0 * np.pi * hz_o
+        # Forward-Euler stability needs dt < 2/ω; integrate well under it.
+        self._gov_max_dt = min(0.05, 0.5 / max(self._wp, self._wo))
+        self._gov: dict | None = None       # tracker state {p, v, R, w, t}
         self._prev_wrist: tuple | None = None   # previous raw wrist sample (p, t) for the jump test
         # Rest references for the stateless roll saturation (_saturate_roll):
         # the ik is freshly constructed AT the rest pose right above. The roll is
@@ -141,6 +167,7 @@ class ArmController:
             self.ik.q,
             rate_limit=float(s.get("sim_rate_limit", 1.8)),
             smooth_hz=float(s.get("sim_smooth_hz", 4.0)),
+            accel_limit=float(s.get("sim_accel_limit", 25.0)),
             lo=self.ik.hard_lo, hi=self.ik.hard_hi)
 
     def wrist_world(self) -> np.ndarray:
@@ -200,34 +227,56 @@ class ArmController:
         return R_w @ quat_to_R(quat_from_axis_angle(self._roll_rm_ee, -remainder))
 
     def _govern(self, pw: np.ndarray, R_t: np.ndarray, t: float) -> tuple[np.ndarray, np.ndarray] | None:
-        """Apply the motion guardrails to the would-be target (world frame).
-        Returns the governed (position, rotation), or None when the motion is a
-        TELEPORT (implied speed > jump_speed): the mapper re-anchors and this
-        tick holds — the movement simply does not happen; the arm glides to the
-        operator's new pose from its current one instead."""
+        """Track the would-be target (world frame) with a critically-damped
+        second-order tracker under velocity AND acceleration caps — position
+        and attitude alike. A step demand leaves as a smooth S-curve: velocity
+        ramps in at ≤ accel_max, cruises at ≤ speed_max, and the PD lands it
+        without overshoot. High-frequency tracking jitter (the raw wrist quat
+        carries ~200°/s of it) dies in the tracker's −40 dB/decade roll-off.
+        The caller's plan() returns None separately when the motion is a
+        TELEPORT (implied raw-wrist speed > jump_speed): the mapper re-anchors
+        and the movement simply does not happen."""
         if self._gov is None:
-            self._gov = {"p": pw.copy(), "R": R_t.copy(), "t": t}
+            self._gov = {"p": pw.copy(), "v": np.zeros(3),
+                         "R": R_t.copy(), "w": np.zeros(3), "t": float(t)}
             return pw, R_t
-        dt = max(float(t) - self._gov["t"], 1e-6)
-        dp = pw - self._gov["p"]
-        dist = float(np.linalg.norm(dp))
-        cap = self.speed_max * dt
-        if dist > cap:
-            pw = self._gov["p"] + dp * (cap / dist)
-        # attitude low-pass + angular cap, in one step: rotate from the previous
-        # commanded attitude toward the target by the smoothing fraction
-        # (1−e^{−dt/τ} — the raw wrist quat carries ~200°/s of high-frequency
-        # tracking jitter that otherwise goes straight to the IK; position has
-        # One-Euro, orientation had NOTHING), bounded by ang_speed_max·dt.
-        rv = rotvec(self._gov["R"].T @ R_t)
-        ang = float(np.linalg.norm(rv))
-        if ang > 1e-9:
-            alpha = 1.0 - float(np.exp(-dt / self.ori_smooth_s)) if self.ori_smooth_s > 0 else 1.0
-            step = min(ang * alpha, self.ang_speed_max * dt)
-            if step < ang:
-                R_t = self._gov["R"] @ quat_to_R(quat_from_axis_angle(rv / ang, step))
-        self._gov = {"p": pw.copy(), "R": R_t.copy(), "t": float(t)}
-        return pw, R_t
+        g = self._gov
+        remaining = max(0.0, min(float(t) - g["t"], 0.5))   # cap runaway gaps
+        g["t"] = float(t)
+        while remaining > 1e-9:
+            dt = min(remaining, self._gov_max_dt)
+            remaining -= dt
+            # position: PD accel toward the demand, norm-clipped (direction-
+            # preserving) to accel_max, velocity to speed_max
+            a = self._wp * self._wp * (pw - g["p"]) - 2.0 * self._wp * g["v"]
+            n = float(np.linalg.norm(a))
+            if n > self.accel_max:
+                a *= self.accel_max / n
+            v = g["v"] + a * dt
+            n = float(np.linalg.norm(v))
+            if n > self.speed_max:
+                v *= self.speed_max / n
+            g["v"] = v
+            g["p"] = g["p"] + v * dt
+            # attitude: the same tracker on SO(3) — angular velocity state w
+            # (world axes), PD accel on the world-frame rotation-vector error
+            e = g["R"] @ rotvec(g["R"].T @ R_t)
+            aw = self._wo * self._wo * e - 2.0 * self._wo * g["w"]
+            n = float(np.linalg.norm(aw))
+            if n > self.ang_accel_max:
+                aw *= self.ang_accel_max / n
+            w = g["w"] + aw * dt
+            n = float(np.linalg.norm(w))
+            if n > self.ang_speed_max:
+                w *= self.ang_speed_max / n
+            g["w"] = w
+            ang = float(np.linalg.norm(w)) * dt
+            if ang > 1e-12:
+                g["R"] = quat_to_R(quat_from_axis_angle(w / np.linalg.norm(w), ang)) @ g["R"]
+        # many tiny rotation products accumulate float drift — re-orthonormalize
+        u, _, vt = np.linalg.svd(g["R"])
+        g["R"] = u @ vt
+        return g["p"].copy(), g["R"].copy()
 
     def plan(self, hand: HandSample | None, engaged: bool, t: float) -> dict | None:
         """Mapping half of a tick: wrist pose → clamped WORLD target. Returns
@@ -255,6 +304,7 @@ class ArmController:
             self._prev_wrist = None
         self._was_engaged = active
         if not active:
+            self.clamp_dist = 0.0
             return None
         # Teleport rejection on the OPERATOR signal (body-frame wrist sample,
         # real metres): tracking glitches measured 58–65 m/s vs ≤2 m/s for real
@@ -273,6 +323,7 @@ class ArmController:
         self._prev_wrist = (w_now.copy(), float(t))
         target = self.mapper.target(mat_to_se3(hand.wrist), t)
         p = np.clip(target.translation(), self.ws_min, self.ws_max)  # workspace box
+        self.clamp_dist = float(np.linalg.norm(target.translation() - p))
         sm = self.pos_filt({"x": p[0], "y": p[1], "z": p[2]}, t)     # One-Euro
         pb = np.array([sm["x"], sm["y"], sm["z"]])                   # target in base frame
         pw = self.base_R @ pb + self.base_pos                        # → world

@@ -26,7 +26,7 @@ def _src(anchor: str) -> OrbitVRSource:
     return OrbitVRSource(rig)
 
 
-def _inject(src: OrbitVRSource, head_pos, wrist_pos, side="right") -> None:
+def _inject(src: OrbitVRSource, head_pos, wrist_pos, side="right", lm0=None) -> None:
     now = time.monotonic()
     H = np.eye(4)
     H[:3, 3] = head_pos
@@ -36,6 +36,11 @@ def _inject(src: OrbitVRSource, head_pos, wrist_pos, side="right") -> None:
     src._head_last = now
     src._wrist[side] = W
     src._wrist_last[side] = now
+    if lm0 is not None:
+        lm = np.zeros((25, 3))
+        lm[0] = lm0
+        src._lm[side] = lm
+        src._lm_last[side] = now
 
 
 def test_head_anchor_recombines_origins():
@@ -69,3 +74,24 @@ def test_head_anchor_without_head_leaves_wrist_raw():
     assert f.head is None
     np.testing.assert_allclose(f.hands["right"].wrist[:3, 3], [0.2, -0.30, -0.35], atol=1e-12)
     assert body_relative_hand_sample(f.hands["right"], f.head, (0, -0.35, 0)).tracked is False
+
+
+def test_keypoint_anchor_is_recenter_proof():
+    """'keypoint' rebuilds the wrist as head + keypoint[0]: whatever arbitrary
+    anchor the wrist stream carries (a recenter moved it 0.5 m once), the
+    reconstruction is unaffected. Rotation still comes from the wrist stream."""
+    src = _src("keypoint")
+    # wrist stream anchored somewhere crazy; keypoint says 30 cm below, 35 fwd
+    _inject(src, head_pos=[0.0, 1.40, 0.0], wrist_pos=[9.9, -9.9, 9.9],
+            lm0=[0.05, -0.30, -0.35])
+    f = src.latest()
+    np.testing.assert_allclose(f.hands["right"].wrist[:3, 3], [0.05, 1.10, -0.35], atol=1e-12)
+    hs = body_relative_hand_sample(f.hands["right"], f.head, (0.0, -0.35, 0.0))
+    assert abs(hs.wrist[1, 3] - 0.05) < 1e-9          # up reads anatomically
+
+
+def test_keypoint_anchor_falls_back_without_landmarks():
+    src = _src("keypoint")
+    _inject(src, head_pos=[0.1, 1.40, 0.05], wrist_pos=[0.2, -0.30, -0.35])  # no lm
+    f = src.latest()
+    np.testing.assert_allclose(f.hands["right"].wrist[:3, 3], [0.3, 1.10, -0.30], atol=1e-12)

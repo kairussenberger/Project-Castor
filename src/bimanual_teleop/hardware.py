@@ -3,10 +3,13 @@ as RenderSink, so TeleopEngine drives visualization or hardware unchanged.
 
 Every arm command passes through a per-side JointCommandShaper before touching
 CAN: clamped to the physical joint limits, per-joint speed-capped
-(`hardware.rate_limit`), and smoothed by a critically-damped tracker
-(`hardware.smooth_hz`) feeding the YAM's motor-side MIT PD. The shaper
-initializes from the arm's MEASURED pose, so the first command glides from
-wherever the robot actually is — no startup snap.
+(`hardware.rate_limit`), acceleration-capped (`hardware.accel_limit` — velocity
+ramps instead of slamming, so the physical frame is never jerked), and smoothed
+by a critically-damped tracker (`hardware.smooth_hz`) feeding the YAM's
+motor-side MIT PD. All caps are per second of wall-clock time, so the motion is
+the same whatever rate the loop achieves. The shaper initializes from the arm's
+MEASURED pose, so the first command glides from wherever the robot actually is
+— no startup snap.
 
 PARTIAL RIGS: `hardware.sides` lists the arms that are physically wired —
 only those are opened/commanded; the engine's commands for other sides are
@@ -51,6 +54,7 @@ def arm_shaper(rig: dict, q0) -> JointCommandShaper:
         q0,
         rate_limit=float(hw.get("rate_limit", 1.2)),
         smooth_hz=float(hw.get("smooth_hz", 3.0)),
+        accel_limit=float(hw.get("accel_limit", 12.0)),
         lo=limits["lower"],
         hi=limits["upper"],
     )

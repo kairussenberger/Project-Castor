@@ -130,6 +130,19 @@ mapping:
   robot_neutral_wrist:
     left:  [-0.22, 0.02, 0.46]
     right: [0.22, 0.02, 0.46]
+  # The robot's REST pose wrists in the same body coords (FK of neutral_q vs the
+  # chest anchor) — pose B of the TWO-POSE calibration (arms relaxed at the
+  # sides). Scales come from pose-A−pose-B DIFFERENCES, so the ORBIT recenter
+  # anchor (which shifts all hand positions by an arbitrary vector — measured
+  # 0.5 m after a desk-start) cancels exactly.
+  robot_rest_wrist:
+    left:  [-0.221, -0.437, -0.032]
+    right: [0.222, -0.440, 0.032]
+  # Pose C of the calibration (palms pressed together in front of the chest)
+  # anchors the LATERAL map at contact width: the operator's measured clap gap
+  # maps to this commanded wrist separation — sized so the capsule guard
+  # (safety.hand_min_separation) leaves the rendered palms just touching.
+  robot_clap_gap: 0.12
   # Where the fitted scale/offset is persisted (per-machine, gitignored — like
   # config/viz_calib.json). Auto-loaded on engine start for LIVE transports only
   # (orbit/vuer); fake/replay stay identity so the acceptance gate and the session
@@ -156,26 +169,59 @@ safety:
   # to CONTACT distance — palms, fingers, or fingertips-to-palm — never through.
   hand_min_separation: 0.12
   hand_capsule_len: 0.19
-  # Motion guardrails (sim AND the gateway to hardware):
+  # Motion guardrails (sim AND the gateway to hardware). Every cap below is per
+  # SECOND of wall-clock time (integrated with the real dt), NOT per frame — the
+  # governed motion is identical at any loop/headset rate, so what the sim shows
+  # is what the real frame does.
   # - target_speed_max / target_ang_speed_max cap how fast the commanded EE
   #   target may translate/rotate (operator p99 measured ≈2 m/s).
+  # - target_accel_max / target_ang_accel_max bound ACCELERATION too: the
+  #   governor is a critically-damped second-order tracker, so a demand leaves
+  #   as a smooth S-curve (velocity ramps in, cruises, lands without overshoot)
+  #   instead of the old rectangle-velocity "blocky" glide. Trades a little lag
+  #   (~5 cm at 0.3 m/s following) for smooth, hardware-friendly motion.
+  #   No-overshoot bound: keep accel ≥ 0.37·speed_max·(2π·smooth_hz); the
+  #   values below carry ≥1.3× margin.
   # - target_jump_speed: implied speeds above this are NOT movements (tracking
   #   glitches measured 58–65 m/s) — the mapper re-anchors and the arm GLIDES;
   #   the violent motion simply never happens.
-  # - sim_rate_limit / sim_smooth_hz: the hardware-style joint command shaper now
-  #   ALSO runs in the sim/render path — published joints can never move faster
-  #   than this, whatever the IK does (singularity flips leave as bounded
-  #   glides). Set sim_rate_limit to hardware.rate_limit (1.2) for exact
-  #   real-robot motion parity before a hardware day.
+  # - sim_rate_limit / sim_smooth_hz / sim_accel_limit: the hardware-style joint
+  #   command shaper now ALSO runs in the sim/render path — published joints can
+  #   never move (or jerk) faster than this, whatever the IK does (singularity
+  #   flips leave as bounded glides). Set sim_rate_limit to hardware.rate_limit
+  #   (1.2) for exact real-robot motion parity before a hardware day.
   target_speed_max: 0.8
+  target_accel_max: 5.0       # m/s² — ramps to full speed in ~0.16 s
+  target_smooth_hz: 2.0       # position tracker bandwidth (critically damped)
   target_jump_speed: 3.0
   target_ang_speed_max: 2.5
-  # Attitude low-pass time constant (s): raw Quest wrist quats carry ~200°/s of
+  target_ang_accel_max: 25.0  # rad/s² — ramps to full turn rate in ~0.1 s
+  # Mid-session ANCHOR-JUMP guard (safety/anchor_guard.py): a recenter, app
+  # restart, or headset sleep moves the ORBIT stream anchors and silently
+  # invalidates the applied calibration — the guard watches the body-relative
+  # wrist signal for coherent discontinuities and a dead stream, locks follow,
+  # and demands a recalibration. Thresholds sized from 19 real sessions
+  # (2026-06-11): normal per-frame deltas p99 < 3 cm; one-frame tracking
+  # glitches of 0.2–1.5 m are common (absorbed by confirm_frames + the
+  # other-hand cross-check); benign stream hiccups measured ≤ 0.9 s.
+  anchor_guard:
+    enabled: true
+    jump_m: 0.25            # one-sample discontinuity beyond this + speed_allow*dt = suspect
+    speed_allow: 4.0        # m/s honest-motion allowance (scales with the sample gap)
+    confirm_frames: 3       # consecutive far samples to confirm (~27 ms at 110 Hz)
+    return_tol: 0.10        # m — snap back within this of pre-jump = glitch, resume
+    coherence_tol: 0.15     # m — both-side jump similarity = shared-anchor event
+    max_sample_gap_s: 0.3   # continuity expires across longer per-side gaps (dropout)
+    blackout_s: 2.0         # live transports: whole stream dead this long → trip
+  # Attitude tracker bandwidth: raw Quest wrist quats carry ~200°/s of
   # high-frequency jitter (worse when the palm rotates away from the cameras);
-  # the commanded attitude slerps toward the demand with this τ. 0 disables.
+  # the second-order tracker rolls it off at −40 dB/decade. target_ori_smooth_hz
+  # sets the bandwidth directly; if absent it derives from the legacy
+  # target_ori_smooth_s first-order τ (ω = 2/τ, matching the old settle time).
   target_ori_smooth_s: 0.12
   sim_rate_limit: 1.8
   sim_smooth_hz: 4.0
+  sim_accel_limit: 25.0   # rad/s² joint accel cap (no-overshoot needs ≥ 0.37·rate·2π·hz ≈ 17)
   workspace:          # axis-aligned EE target bounds in arm base frame (m)
     min: [-0.6, -0.85, -0.6]   # y-min lowered: arms-down home wrist sits at base-y≈-0.56;
     max: [0.6, 0.7, 0.6]       # old -0.2 clipped it +0.36m on engage -> arms curled to center
@@ -187,8 +233,9 @@ safety:
 hardware:
   max_vel_scale: 0.35 # derate ik.max_vel for real motors (sim keeps full speed)
   rate_limit: 1.2     # rad/s hard per-joint speed cap at the CAN boundary
-  smooth_hz: 4.0      # critically-damped command tracker bandwidth (the "PD" feel);
-                      # matches the sim shaper (sim_smooth_hz) so metal tracks as crisply
+  smooth_hz: 3.0      # critically-damped command tracker bandwidth (the "PD" feel)
+  accel_limit: 12.0   # rad/s² per-joint accel cap — velocity RAMPS, never slams
+                      # (no-overshoot needs ≥ 0.37·rate·2π·hz ≈ 8.4; 1.4× margin)
   # Per-joint speed cap the dashboard's RUN ON ROBOT button applies to replays.
   # 0.5 was very conservative and CLIPPED any motion faster than that (roll/reach
   # looked laggy vs the uncapped sim). 1.0 ≈ 57°/s tracks recordings far more
@@ -225,11 +272,26 @@ vr:
   calib_seconds: 0.0  # arm mapping is calibration-free; >0 re-enables the optional legacy startup stillness hold (only steers arms when body_relative is false)
   cross_gap: 0.05     # min world-Y gap each hand keeps from center (anti-overlap guard, metres)
   control_port: 8201  # localhost TCP line-JSON engine commands (dashboard CALIBRATE button)
-  # ORBIT streams the head floor-anchored but the wrists EYE-anchored (measured on
-  # a real session — see vr/orbit_source.py docstring). 'head' re-anchors wrist
-  # translations at the live head pose so the absolute body-relative mapping sees
-  # one consistent origin; 'world' = raw passthrough (future fixed ORBIT builds).
-  orbit_wrist_anchor: head
+  # SAFETY: the operator's body frame yaw. 'locked' (default) = the forward
+  # direction is LATCHED (from the calibration's arm-defined forward; before
+  # that, from the first head sample) — looking left/right or taking the
+  # headset off can NEVER move the arms (head position already cancels in the
+  # body-relative subtraction; this removes head ROTATION too). 'head' = legacy
+  # live head yaw (only sane for true-world sources like Vuer).
+  body_yaw: locked
+  # SAFETY: live transports (orbit/vuer) hold the arms at rest and ignore all
+  # hand input until the operator completes the guided calibration IN THIS
+  # SESSION — a fresh ORBIT recenter anchor makes any previous session's
+  # absolute mapping untrustworthy. fake/replay are exempt (deterministic
+  # tests/analysis). Set false to restore follow-on-startup.
+  require_calibration: true
+  # ORBIT streams the head floor-anchored but the wrists in a RECENTER-anchored
+  # frame (and a recenter/desk-start moves that anchor arbitrarily — measured
+  # +0.5 m once, breaking calibration). 'keypoint' rebuilds each wrist as
+  # head_pos + hand keypoint[0] (keypoints are head-anchored, world axes) —
+  # NO anchor assumption, recenter-proof. 'head' = legacy live-head re-anchor;
+  # 'world' = raw passthrough.
+  orbit_wrist_anchor: keypoint
   cert_file: cert.pem
   key_file: key.pem
   ngrok: false        # true to tunnel for the Quest browser

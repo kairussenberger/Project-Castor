@@ -39,10 +39,13 @@ import numpy as np
 from .arms.arm_control import ArmController
 from .config import REPO_ROOT, SIDES
 from .hands.hand_control import HandController
+from .safety.anchor_guard import AnchorGuard
 from .safety.separation import separate_capsules
-from .vr.calibrate import Calibrator, R_base_from_body, body_relative_hand_sample
+from .vr.calibrate import (Calibrator, R_base_from_body, body_relative_hand_sample,
+                           head_op_axes)
 from .vr.frames import HandSample, VRFrame
-from .vr.neutral_calib import NeutralPoseCalibration, load_calibration
+from .vr.neutral_calib import (NeutralPoseCalibration, load_calibration,
+                               parse_calibration)
 
 
 class TeleopEngine:
@@ -79,6 +82,12 @@ class TeleopEngine:
         # --- operator neutral-pose calibration (position-only, runtime) ----- #
         self.neutral = NeutralPoseCalibration(rig)
         self.calib_summary: dict | None = None     # applied scale/offset, for the dashboard chip
+        self.calib_result = None                   # full applied CalibResult (recorder embeds it)
+        # SAFETY — mid-session anchor-jump guard (safety/anchor_guard.py): a
+        # recenter/app-restart/headset-sleep moves the stream anchors and makes
+        # the applied fit silently wrong. Constructed BEFORE the auto-load below
+        # (_apply_calibration resets it).
+        self.guard = AnchorGuard(rig)
         self._calib_file = self._resolve_calib_path(rig)
         self._req_calib = False                    # set from the control-server thread,
         self._req_calib_cancel = False             # consumed by tick() on the control loop
@@ -87,10 +96,35 @@ class TeleopEngine:
         # identity so the acceptance gate and the session scorer are deterministic
         # (override with vr.use_calib: true for calibrated replays).
         transport = rig.get("vr", {}).get("transport", "fake")
-        if self._calib_file and (transport in ("orbit", "vuer") or rig.get("vr", {}).get("use_calib")):
+        force_fresh = bool(rig.get("vr", {}).get("require_calibration", True))
+        if self._calib_file and ((transport in ("orbit", "vuer") and not force_fresh)
+                                 or rig.get("vr", {}).get("use_calib")):
             res = load_calibration(self._calib_file)
             if res is not None:
                 self._apply_calibration(res, announce=f"loaded {self._calib_file}")
+        # A recording's own EMBEDDED fit beats everything: it is what actually
+        # ran while the session was captured, and raw ORBIT frames are only
+        # meaningful together with it (anchors move metres between sessions).
+        # run_teleop/analyze inject it for replay; deterministic — it's file data.
+        emb = rig.get("vr", {}).get("_embedded_calib")
+        if emb:
+            res = parse_calibration(emb)
+            if res is not None:
+                self._apply_calibration(res, announce="embedded in recording")
+            else:
+                print("[calib] recording embeds a calibration that fails the "
+                      "load screen — replaying IDENTITY", flush=True)
+        # SAFETY — body-frame yaw lock: head ROTATION must never drive the arms
+        # (head POSITION already cancels in the body-relative subtraction). The
+        # yaw frame is latched from the first head sample and re-latched to the
+        # operator's ARM-DEFINED forward when a calibration completes; looking
+        # left/right or pulling the headset off cannot move the arms.
+        self._yaw_lock = str(rig.get("vr", {}).get("body_yaw", "locked")) == "locked"
+        self._yaw_R: np.ndarray | None = None
+        # SAFETY — live transports follow only after an IN-SESSION calibration:
+        # a fresh ORBIT recenter anchor invalidates any previous absolute fit.
+        self.follow_locked = (bool(rig.get("vr", {}).get("require_calibration", True))
+                              and transport in ("orbit", "vuer"))
         # Pairwise hand guard: capsule length (wrist → fingertips) + min distance
         # between the two capsules (0 disables).
         self.hand_min_sep = float(rig.get("safety", {}).get("hand_min_separation", 0.12))
@@ -105,8 +139,15 @@ class TeleopEngine:
         if not self.calibrated:
             self._calibration_tick(frame, t)
             return
+        samples = {s: self._arm_hand_sample(frame.hands.get(s) if frame else None, frame)
+                   for s in SIDES}
+        wb = {s: self._wrist_body_pos(samples[s]) for s in SIDES}
+        holds = self._guard_tick(wb, frame, t)
         if self.neutral.active:
-            self._neutral_tick(frame, t)
+            # Suspect sides feed the capture nothing (a glitch sample would only
+            # reset the stillness window, but why let it in at all).
+            self._neutral_tick({s: (None if holds.get(s) else wb[s]) for s in SIDES},
+                               frame, t)
             return
         # Keep the "CALIBRATED ✓" banner up briefly, then clear it.
         if self.calib_status is not None:
@@ -114,12 +155,49 @@ class TeleopEngine:
                 self.calib_status = None
         plans = {}
         for s in SIDES:
-            hs = frame.hands.get(s) if frame else None
-            plans[s] = self.arm[s].plan(self._arm_hand_sample(hs, frame), engaged.get(s, False), t)
+            follow = engaged.get(s, False) and not self.follow_locked
+            # A guard HOLD feeds the mapper nothing: the arm parks for the few
+            # confirm frames (glitch) or until the trip locks follow (anchor).
+            plans[s] = self.arm[s].plan(None if holds.get(s) else samples[s], follow, t)
         self._separate_hands(plans)
         for s in SIDES:
             self.sink.set_arm(s, self.arm[s].commit(plans[s], t))
             self.sink.set_hand(s, self.hand[s].update(frame.hands.get(s) if frame else None, t))
+
+    # ---- anchor-jump guard -------------------------------------------------- #
+    @staticmethod
+    def _wrist_body_pos(hs: HandSample | None) -> np.ndarray | None:
+        """Body-relative wrist position for the guard, or None when unusable."""
+        if hs is None or not hs.tracked:
+            return None
+        W = np.asarray(hs.wrist, dtype=float)
+        if W.shape != (4, 4) or not np.all(np.isfinite(W[:3, 3])):
+            return None
+        return W[:3, 3]
+
+    def _guard_tick(self, wb: dict[str, np.ndarray | None], frame: VRFrame | None,
+                    t: float) -> dict[str, bool]:
+        if not self.guard.enabled:
+            return {s: False for s in SIDES}
+        fresh = frame is not None and (frame.head is not None
+                                       or any(h is not None and h.tracked
+                                              for h in (frame.hands or {}).values()))
+        # Armed whenever a trip would protect something: arms following, or a
+        # capture in flight (poses straddling an anchor change must not be fit).
+        armed = (not self.follow_locked) or self.neutral.active
+        holds = self.guard.observe(wb, fresh, t, armed=armed)
+        if self.guard.take_trip():
+            reason = self.guard.trip_reason or "tracking anchor changed"
+            self.follow_locked = True              # only a fresh calibration unlocks
+            if self.neutral.active:
+                self.neutral.cancel("tracking jumped mid-capture — recalibrate from the start")
+            self._done_t = None                    # banner stays until recalibration
+            self.calib_status = {"active": False, "kind": "guard", "phase": "tripped",
+                                 "progress": 0.0, "remaining": 0.0,
+                                 "left": False, "right": False,
+                                 "msg": f"TRACKING JUMPED — {reason}. Recalibrate to resume."}
+            print(f"[guard] TRIP: {reason} — arms locked until recalibration", flush=True)
+        return holds
 
     # ---- pairwise hand separation ----------------------------------------- #
     def _separate_hands(self, plans: dict[str, dict | None]) -> None:
@@ -186,8 +264,15 @@ class TeleopEngine:
     def _apply_calibration(self, res, announce: str) -> None:
         for s in SIDES:
             self.arm[s].mapper.set_calibration(res.axis_scale, res.body_offset,
-                                               getattr(res, "lat_ref", 0.0))
+                                               getattr(res, "lat_ref", 0.0),
+                                               getattr(res, "lat_center", 0.0),
+                                               getattr(res, "lat_knots", None))
         self.calib_summary = res.summary()
+        self.calib_result = res
+        # The fit absorbs whatever the anchors are NOW — forgive any latched
+        # trip and reseed continuity (the yaw re-latch that may follow changes
+        # the body axes under the watched signal).
+        self.guard.reset()
         print(f"[calib] {announce}: axis_scale={np.round(res.axis_scale, 3).tolist()} "
               f"body_offset={np.round(res.body_offset, 3).tolist()}", flush=True)
 
@@ -208,13 +293,17 @@ class TeleopEngine:
             if self.neutral.active:
                 self.neutral.cancel("calibration cleared")
             for s in SIDES:
-                self.arm[s].mapper.set_calibration(np.ones(3), np.zeros(3), 0.0)
+                self.arm[s].mapper.set_calibration(np.ones(3), np.zeros(3), 0.0, 0.0, None)
             self.calib_summary = None
+            self.calib_result = None
             if self._calib_file is not None:
                 try:
                     self._calib_file.unlink(missing_ok=True)
                 except OSError:
                     pass
+            if bool(self.rig.get("vr", {}).get("require_calibration", True)) and \
+                    self.rig.get("vr", {}).get("transport") in ("orbit", "vuer"):
+                self.follow_locked = True            # no valid calibration → no motion
             self.calib_status = {"active": False, "kind": "neutral", "phase": "cancelled",
                                  "progress": 0.0, "remaining": 0.0, "left": False,
                                  "right": False, "msg": "calibration cleared — back to 1:1"}
@@ -229,30 +318,38 @@ class TeleopEngine:
             self._req_calib = False
             if not self.neutral.active:
                 self.neutral.start(t)
-                print("[calib] neutral-pose capture started — extend both arms forward "
-                      "and hold still", flush=True)
+                print("[calib] neutral-pose capture started — relax both arms down "
+                      "at your sides and hold still", flush=True)
 
-    def _neutral_tick(self, frame: VRFrame | None, t: float) -> None:
+    def _neutral_tick(self, wb: dict[str, np.ndarray | None], frame: VRFrame | None,
+                      t: float) -> None:
         """One capture tick: arms FREEZE at their current pose, fingers keep
-        tracking, the state machine eats body-relative wrist samples."""
-        samples: dict[str, np.ndarray | None] = {}
+        tracking, the state machine eats body-relative wrist samples (the same
+        vectors the anchor guard watched this tick)."""
         for s in SIDES:
             hs_raw = frame.hands.get(s) if frame else None
-            hs = self._arm_hand_sample(hs_raw, frame)
-            w = None
-            if hs is not None and hs.tracked:
-                W = np.asarray(hs.wrist, dtype=float)
-                if W.shape == (4, 4) and np.all(np.isfinite(W[:3, 3])):
-                    w = W[:3, 3]
-            samples[s] = w
             self.sink.set_arm(s, self.arm[s].ik.q)                  # hold current pose
             self.sink.set_hand(s, self.hand[s].update(hs_raw, t))   # fingers can track meanwhile
-        self.neutral.tick(samples, t)
+        self.neutral.tick(wb, t)
         self.calib_status = self.neutral.status(t)
         if self.neutral.phase == "done" and self.neutral.result is not None:
             res = self.neutral.result
             self.neutral.result = None                              # consume once
             self._apply_calibration(res, announce="neutral-pose fit")
+            self.follow_locked = False                              # arms enabled by THIS fit
+            if self._yaw_lock and res.forward_body is not None and self._yaw_R is not None:
+                # re-latch the yaw frame to the operator's measured arm-forward
+                axes = head_op_axes(np.block([[self._yaw_R, np.zeros((3, 1))],
+                                              [np.zeros((1, 3)), np.ones((1, 1))]]))
+                f_w = axes @ np.array([res.forward_body[0], 0.0, res.forward_body[1]])
+                f_w[1] = 0.0
+                n = float(np.linalg.norm(f_w))
+                if n > 1e-6:
+                    f_w /= n
+                    r_w = np.cross(f_w, np.array([0.0, 1.0, 0.0]))
+                    r_w /= (np.linalg.norm(r_w) + 1e-12)
+                    u_w = np.cross(r_w, f_w)
+                    self._yaw_R = self._yaw_only_R(np.column_stack([r_w, u_w, f_w]))
             if self._calib_file is not None:
                 try:
                     res.save(self._calib_file)
@@ -270,9 +367,38 @@ class TeleopEngine:
     def _arm_hand_sample(self, hs: HandSample | None, frame: VRFrame | None) -> HandSample | None:
         if not self.body_relative:
             return hs
-        return body_relative_hand_sample(hs, frame.head if frame else None, self.torso_from_head,
+        head = frame.head if frame else None
+        if head is not None and self._yaw_lock:
+            if self._yaw_R is None and self._head_latchable(head):
+                self._yaw_R = self._yaw_only_R(head_op_axes(head))
+            if self._yaw_R is None:
+                head = None        # no sane yaw frame yet → fail closed (untracked),
+            else:                  # never let raw head yaw drive the arms
+                head = np.asarray(head, dtype=float).copy()
+                head[:3, :3] = self._yaw_R
+        return body_relative_hand_sample(hs, head, self.torso_from_head,
                                          mirror_forward=self.mirror_forward,
                                          mirror_lateral=self.mirror_lateral)
+
+    @staticmethod
+    def _head_latchable(head) -> bool:
+        """A head sample is fit to LATCH the session yaw frame only when it is
+        finite and its view direction has a real horizontal component — the
+        first samples of a session (headset still being put on, NaN warm-up,
+        looking straight down at the desk) would otherwise latch a degenerate
+        or reflected frame and poison every body-relative sample after it."""
+        H = np.asarray(head, dtype=float)
+        if H.shape != (4, 4) or not np.all(np.isfinite(H)):
+            return False
+        fwd = -H[:3, 2]
+        return float(np.hypot(fwd[0], fwd[2])) > 0.2
+
+    @staticmethod
+    def _yaw_only_R(op_axes: np.ndarray) -> np.ndarray:
+        """A yaw-only head rotation whose head_op_axes() reproduces `op_axes`:
+        gravity-up, view-forward = the given horizontal forward."""
+        r, f = op_axes[:, 0], op_axes[:, 2]
+        return np.column_stack([r, np.array([0.0, 1.0, 0.0]), -f])
 
     def _calibration_tick(self, frame: VRFrame | None, t: float) -> None:
         """Collect resting-stance samples; hold arms at the rest pose; fingers track."""

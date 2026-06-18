@@ -1,0 +1,1 @@
+{"version": 4, "axis_scale": [1.376, 0.971, 1.223], "body_offset": [0.0, -0.889, 0.001], "lat_ref": 0.0, "lat_center": 0.0, "lat_knots": null, "forward_body": null, "meta": {"stamp": "2026-06-12 10:53:50", "retrofitted_from_log": true, "note": "lat_center/lat_knots lost (operator_calib.json overwritten before snapshotting began) — lateral is plain s_lat scaling"}}

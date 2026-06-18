@@ -102,6 +102,13 @@ def main() -> int:
         rig["vr"]["replay_loop"] = bool(args.loop)
 
     src = make_source(rig)
+    # A recording that embeds its session's calibration replays THROUGH it —
+    # raw ORBIT frames are only meaningful with their fit (anchors move metres
+    # between sessions). Old recordings/synthetic fixtures have none → identity.
+    if args.vr == "replay" and getattr(src, "calib", None):
+        rig["vr"]["_embedded_calib"] = src.calib
+        log.info("replay: applying the calibration embedded in the recording (%s)",
+                 (src.calib.get("meta") or {}).get("stamp", "no stamp"))
     clutch_name = args.clutch or ("recorded" if args.vr == "replay" else "always")
     if clutch_name == "gesture":
         clutch = GestureClutch()
@@ -187,8 +194,10 @@ def main() -> int:
             ctl.close()
         sink.close()
         if recorder is not None:
-            recorder.save(args.record)
-            log.info("recorded %d frames → %s", len(recorder), args.record)
+            calib = engine.calib_result.payload() if engine.calib_result is not None else None
+            recorder.save(args.record, calib=calib)
+            log.info("recorded %d frames → %s%s", len(recorder), args.record,
+                     " (session calibration embedded)" if calib else "")
         log.info("stopped (ran %.1fs, ~%.0f Hz)", time.monotonic() - t0, rate.hz)
     return 0
 

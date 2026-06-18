@@ -415,15 +415,20 @@ def test_engine_body_motion_does_not_drive_arm_but_hand_lift_does():
         T[:3, 3] = p
         return T
 
-    def frame(head, torso_to_wrist):
-        op = head_op_axes(head)
+    def frame(head, torso_to_wrist, ref_head=None):
+        # Models the REAL ORBIT stream + reconstruction: wrist translation rides
+        # the head POSITION (head + keypoint), but NOT the head ROTATION. The
+        # offsets are built in REF_HEAD's frame so only the hand pose itself
+        # defines them — a later head turn/translation changes nothing physical.
+        ref = head if ref_head is None else ref_head
+        op = head_op_axes(ref)
         torso = np.array([0.0, -0.35, 0.0])
         hands = {}
         for s in SIDES:
             ttw = np.asarray(torso_to_wrist, dtype=float).copy()
             if s == "right":
                 ttw[0] = -ttw[0]   # mirrored: hands APART so no pair/capsule guard binds
-            wrist = pose(head[:3, :3], head[:3, 3] + op @ (torso + ttw))  # rigid + proper
+            wrist = pose(ref[:3, :3], head[:3, 3] + op @ (torso + ttw))
             hands[s] = HandSample(tracked=True, wrist=wrist.copy(), landmarks=synthetic_webxr_hand(0.0))
         return VRFrame(stamp=0.0, head=head, hands=hands)
 
@@ -445,15 +450,18 @@ def test_engine_body_motion_does_not_drive_arm_but_hand_lift_does():
         engine.tick(frame(head0, torso_to_wrist), engaged, i / 120.0)
     p0 = engine.arm["left"].ik.fk_wrist().translation()
 
+    # SAFETY CONTRACT: head motion (rotation AND translation — looking around,
+    # pulling the headset off) must produce ZERO arm input. The hands stay
+    # physically still (their head-anchored stream values are unchanged).
     head_moved = pose(euler_to_R([0.0, 0.6, 0.0]), [0.35, 1.72, -0.25])
     for i in range(480, 520):
-        engine.tick(frame(head_moved, torso_to_wrist), engaged, i / 120.0)
+        engine.tick(frame(head_moved, torso_to_wrist, ref_head=head0), engaged, i / 120.0)
     p_same = engine.arm["left"].ik.fk_wrist().translation()
     assert np.linalg.norm(p_same - p0) < 1e-4
 
     lifted = torso_to_wrist + np.array([0.0, 0.16, 0.0])
     for i in range(520, 760):
-        engine.tick(frame(head_moved, lifted), engaged, i / 120.0)
+        engine.tick(frame(head_moved, lifted, ref_head=head0), engaged, i / 120.0)
     p_lift = engine.arm["left"].ik.fk_wrist().translation()
     assert np.linalg.norm(p_lift - p_same) > 0.02
 

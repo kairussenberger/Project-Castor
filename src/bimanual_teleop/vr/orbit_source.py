@@ -62,7 +62,11 @@ HAND_PORTS = {"right": 8087, "left": 8088}
 WRIST_PORTS = {"right": 8122, "left": 8123}
 HEAD_PORT = 8200
 DRAIN_PORTS = (8095, 8100)
+# In-headset screen view (scripts/headset_view.py binds its own PUB here) —
+# tunnel-only: the link watchdog keeps its reverse alive, but it is NOT bound here.
+VIDEO_PANEL_PORT = 10505
 _ALL_PORTS = (*HAND_PORTS.values(), *WRIST_PORTS.values(), HEAD_PORT, *DRAIN_PORTS)
+_TUNNEL_PORTS = (*_ALL_PORTS, VIDEO_PANEL_PORT)
 
 
 def _S4(flip: str = "z") -> np.ndarray:
@@ -127,10 +131,16 @@ class OrbitVRSource(VRSource):
         self.head_timeout = float(v.get("orbit_head_timeout", max(1.0, self.timeout)))
         self.auto_reverse = bool(v.get("orbit_adb_reverse", True))
         self.S4 = _S4(str(v.get("orbit_flip", "z")))
-        # 'head' (default): re-anchor wrist translations at the live head pose —
-        # ORBIT streams wrists eye-anchored but the head floor-anchored (see module
-        # docstring). 'world': raw passthrough.
-        self.wrist_anchor = str(v.get("orbit_wrist_anchor", "head"))
+        # Wrist translation reconstruction (see module docstring):
+        #  'keypoint' (default): head_pos + hand keypoint[0] — the keypoints are
+        #     streamed HEAD-ANCHORED (world axes), so this needs NO assumption
+        #     about the wrist stream's recenter anchor. Measured failure of
+        #     'head': starting/recentering ORBIT with the headset on the desk
+        #     moved the eye-anchor ~0.5 m down and every wrist read 0.5 m high
+        #     (calibration refused; mapping shifted).
+        #  'head': wrist-stream translation + live head (exact only while the
+        #     live head matches the recenter pose). 'world': raw passthrough.
+        self.wrist_anchor = str(v.get("orbit_wrist_anchor", "keypoint"))
         self.viz_port = int(v.get("orbit_viz_port", 8099))
         self.viz_enabled = bool(v.get("orbit_viz", True))
         self.viz_url = None
@@ -171,13 +181,16 @@ class OrbitVRSource(VRSource):
                 wrist_fresh = w is not None and (now - self._wrist_last[s]) < self.timeout
                 lm = self._lm[s] if (now - self._lm_last[s]) < self.timeout else None
                 if wrist_fresh:
-                    if self.wrist_anchor == "head" and head is not None:
-                        # ORBIT wrists are eye-anchored, the head floor-anchored:
-                        # re-anchor the TRANSLATION so both share one origin (the
+                    if head is not None and self.wrist_anchor != "world":
+                        # Rebuild the TRANSLATION in one consistent origin (the
                         # body-relative subtraction downstream then cancels the
-                        # head exactly). Rotation is already world-axes — untouched.
+                        # head exactly). Rotation is already world-axes — the
+                        # wrist stream's attitude is kept untouched.
                         w = w.copy()
-                        w[:3, 3] += head[:3, 3]
+                        if self.wrist_anchor == "keypoint" and lm is not None:
+                            w[:3, 3] = head[:3, 3] + lm[0]   # anchor-independent
+                        else:
+                            w[:3, 3] += head[:3, 3]          # 'head' / no landmarks
                     hands[s] = HandSample(tracked=True, wrist=w, landmarks=lm,
                                           pinch=_pinch_from_landmarks(lm))
                 else:
@@ -250,17 +263,17 @@ class OrbitVRSource(VRSource):
     def _adb_reverse(self) -> None:
         if not shutil.which("adb"):
             print("[orbit] adb not found — set up `adb reverse` for "
-                  f"{', '.join(map(str, _ALL_PORTS))} yourself.", flush=True)
+                  f"{', '.join(map(str, _TUNNEL_PORTS))} yourself.", flush=True)
             return
         ok = 0
-        for p in _ALL_PORTS:
+        for p in _TUNNEL_PORTS:
             try:
                 r = subprocess.run(["adb", "reverse", f"tcp:{p}", f"tcp:{p}"],
                                    capture_output=True, timeout=5)
                 ok += (r.returncode == 0)
             except (subprocess.SubprocessError, OSError):
                 pass
-        print(f"[orbit] adb reverse set on {ok}/{len(_ALL_PORTS)} ports.", flush=True)
+        print(f"[orbit] adb reverse set on {ok}/{len(_TUNNEL_PORTS)} ports.", flush=True)
 
     @staticmethod
     def _adb_device_state() -> str:
@@ -297,7 +310,7 @@ class OrbitVRSource(VRSource):
                             if a == b}
                 except (subprocess.SubprocessError, OSError, ValueError):
                     have = set()
-                missing = [p for p in _ALL_PORTS if p not in have]
+                missing = [p for p in _TUNNEL_PORTS if p not in have]
                 if missing:
                     print(f"[orbit] quest link restored, reverses missing {missing} "
                           "— re-asserting", flush=True)

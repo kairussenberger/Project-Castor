@@ -11,11 +11,12 @@ import numpy as np
 from bimanual_teleop.safety.shaper import JointCommandShaper
 
 
-def _make(rate=1.0, hz=3.0, q0=None):
+def _make(rate=1.0, hz=3.0, q0=None, accel=None):
     lo = -np.ones(6) * 3.0
     hi = np.ones(6) * 3.0
     return JointCommandShaper(q0 if q0 is not None else np.zeros(6),
-                              rate_limit=rate, smooth_hz=hz, lo=lo, hi=hi)
+                              rate_limit=rate, smooth_hz=hz, lo=lo, hi=hi,
+                              accel_limit=accel)
 
 
 def test_target_jump_is_speed_capped_and_converges_without_overshoot():
@@ -75,6 +76,53 @@ def test_reset_reanchors_at_measured_pose():
     sh.reset(np.full(6, -0.5), t=10.0)
     q = sh.shape(np.full(6, -0.5), 10.0 + 1 / 120)
     assert np.allclose(q, -0.5, atol=1e-2)
+
+
+def test_accel_limit_ramps_velocity_instead_of_slamming():
+    """With accel_limit set, a step target produces an S-CURVE: velocity ramps
+    to the cap at ≤ accel_limit (never the old instant slam), cruises, and the
+    critically-damped landing still does not overshoot."""
+    accel = 12.0
+    sh = _make(rate=1.0, accel=accel)
+    tgt = np.array([2.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    t, dt = 0.0, 1 / 120
+    prev_q = sh.shape(tgt, t)
+    prev_v = 0.0
+    max_dv = 0.0
+    overshoot = 0.0
+    ramp_ticks = 0
+    for i in range(int(8.0 / dt)):
+        t += dt
+        q = sh.shape(tgt, t)
+        v = float((q[0] - prev_q[0]) / dt)
+        max_dv = max(max_dv, abs(v - prev_v) / dt)
+        overshoot = max(overshoot, float(q[0] - 2.0))
+        if v < 0.9 and ramp_ticks == i:        # still ramping up, count ticks
+            ramp_ticks += 1
+        prev_q, prev_v = q, v
+    assert max_dv <= accel * 1.05 + 1e-6, f"accel hit {max_dv:.1f} rad/s²"
+    assert ramp_ticks >= 5, "velocity reached the cap near-instantly — still blocky"
+    assert overshoot < 5e-3
+    assert abs(prev_q[0] - 2.0) < 1e-3
+
+
+def test_shaped_motion_is_frame_rate_independent():
+    """The caps are per SECOND, not per frame: the same step tracked at 120 Hz
+    and at 30 Hz must land on the same trajectory (sub-stepping makes the
+    integration rate-independent) — what the sim shows is what hardware does."""
+    tgt = np.full(6, 1.5)
+    qs = {}
+    for hz in (120, 30):
+        sh = _make(rate=1.0, accel=12.0)
+        sh.shape(tgt, 0.0)
+        q_mid = None
+        for i in range(1, int(4.0 * hz) + 1):
+            q = sh.shape(tgt, i / hz)
+            if q_mid is None and i / hz >= 0.75:
+                q_mid = q
+        qs[hz] = (q_mid, q)
+    assert np.allclose(qs[120][0], qs[30][0], atol=0.05), "mid-glide diverged across rates"
+    assert np.allclose(qs[120][1], qs[30][1], atol=1e-3), "settled pose diverged across rates"
 
 
 def test_arm_shaper_built_from_rig_clamps_to_yam_hardstops():

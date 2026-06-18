@@ -3,7 +3,8 @@
 System overview, failsafe inventory, tooling index, and the sim→real checklist
 live in `docs/ARCHITECTURE.md` — keep that page current when changing any of
 them. The hardware boundary (`HardwareSink`) must always command through
-`safety/shaper.py` (limit-clamp + speed cap + PD smoothing); never bypass it.
+`safety/shaper.py` (limit-clamp + speed cap + accel cap + PD smoothing); never
+bypass it. All motion caps are per SECOND (real-dt integrated), never per frame.
 
 THE MOTOR BOUNDARY IS A DIFFERENT JOINT CONVENTION: this rig's motor zeros do
 NOT match this repo's model NOR i2rt's own convention (measured on metal: the

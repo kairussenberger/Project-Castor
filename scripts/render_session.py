@@ -73,10 +73,17 @@ def shaded_colors(tris: np.ndarray, base_rgb, light=(0.4, 0.3, 0.85)) -> np.ndar
 # --------------------------------------------------------------------------- #
 def capture(path: str, rig: dict):
     src = ReplaySource(path)
+    if src.calib:
+        # Replay through the calibration that ran during the session — raw
+        # ORBIT frames are only meaningful with their fit (see REPLAY_LIBRARY).
+        rig["vr"]["_embedded_calib"] = src.calib
+        print("[render] applying the session calibration embedded in the recording")
     sink = NullSink()
     engine = TeleopEngine(rig, sink)
     torso = np.asarray(rig["vr"]["torso_from_head"], float)
-    anchors = {s: {"R": None, "ee": None, "prev": None} for s in SIDES}
+    blend = float(rig.get("mapping", {}).get("engage_blend_s", 1.0))
+    anchors = {s: {"R": None, "ee": None, "prev": None, "t_eng": None, "settled": False}
+               for s in SIDES}
     frames = []
     for i in range(len(src.t)):
         t_i = float(src.t[i])
@@ -99,6 +106,17 @@ def capture(path: str, rig: dict):
                 a["prev"] = m.anchor_ctrl
                 a["R"] = np.asarray(hs.wrist, float)[:3, :3].copy()
                 a["ee"] = m.anchor_ee.rotation().as_matrix()
+                a["t_eng"], a["settled"] = t_i, False
+            elif (not a["settled"] and a["t_eng"] is not None
+                  and t_i - a["t_eng"] > 2.0 * blend
+                  and hs is not None and hs.tracked and arm.cmd_R is not None):
+                # Re-zero the readout reference POST-GLIDE: a replay engages
+                # from the rest pose, and the engage glide would otherwise bake
+                # ~120° of one-time attitude convergence into "rotation since
+                # engage" while the hand readout starts at 0.
+                a["R"] = np.asarray(hs.wrist, float)[:3, :3].copy()
+                a["ee"] = arm.cmd_R.copy()
+                a["settled"] = True
             hand_ang = cmd_ang = 0.0
             if a["R"] is not None and arm.cmd_R is not None and hs is not None and hs.tracked:
                 hand_ang = np.degrees(np.linalg.norm(rotvec(np.asarray(hs.wrist)[:3, :3] @ a["R"].T)))
@@ -142,6 +160,14 @@ def make_renderer(rig: dict, frames: list, fig, debug_links: bool = False):
     axh = fig.add_subplot(1, 2, 1, projection="3d")
     axr = fig.add_subplot(1, 2, 2, projection="3d")
 
+    # Auto-centre the hands panel on THIS session's data: ORBIT anchors put the
+    # raw torso-relative joints metres from the origin on some sessions (the
+    # embedded calibration absorbs that for the ROBOT side; the legacy fixed
+    # box just rendered an empty panel). Same framing, recentred.
+    _ws = [f["hand"][s]["wrist_body"] for f in frames for s in SIDES if f["hand"].get(s)]
+    _hc = np.median(np.stack(_ws), axis=0) if _ws else np.zeros(3)
+    h_off = _hc - np.array([0.0, 0.1, 0.325])      # legacy box centre, body [right, up, fwd]
+
     def draw(idx: int):
         f = frames[idx]
         axh.cla(), axr.cla()
@@ -158,8 +184,12 @@ def make_renderer(rig: dict, frames: list, fig, debug_links: bool = False):
                 v = origin + 0.05 * h["R_body"][:, k]
                 axh.plot([origin[0], v[0]], [origin[2], v[2]], [origin[1], v[1]],
                          c=c, lw=2.8, solid_capstyle="round")
-        axh.scatter([0], [0], [0], c="#caa520", s=40, marker="s")          # torso proxy
-        axh.set_xlim(-0.45, 0.45), axh.set_ylim(0.0, 0.65), axh.set_zlim(-0.35, 0.55)
+        if (abs(h_off[0]) <= 0.45 and -0.65 <= h_off[2] <= 0.0
+                and -0.55 <= h_off[1] <= 0.35):                            # torso proxy, if in view
+            axh.scatter([0], [0], [0], c="#caa520", s=40, marker="s")
+        axh.set_xlim(-0.45 + h_off[0], 0.45 + h_off[0])
+        axh.set_ylim(0.0 + h_off[2], 0.65 + h_off[2])
+        axh.set_zlim(-0.35 + h_off[1], 0.55 + h_off[1])
         axh.set_box_aspect((1, 0.72, 1)), axh.view_init(elev=16, azim=-125)
         axh.set_xticks([]), axh.set_yticks([]), axh.set_zticks([])
         la, ra = f["ang"]["left"][0], f["ang"]["right"][0]

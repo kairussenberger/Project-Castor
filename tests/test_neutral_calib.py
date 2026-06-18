@@ -21,61 +21,147 @@ from bimanual_teleop.safety.separation import separate_targets
 from bimanual_teleop.vr import neutral_calib as nc
 from bimanual_teleop.vr.frames import SE3, VRFrame, HandSample, ClutchMapper
 from bimanual_teleop.vr.neutral_calib import (
-    CalibResult, NeutralPoseCalibration, fit_neutral, load_calibration)
+    CalibResult, NeutralPoseCalibration, fit_two_pose, load_calibration)
 
 
 # --------------------------------------------------------------------------- #
-# fit math
+# fit math (two-pose: anchor- and head-yaw-proof)
 # --------------------------------------------------------------------------- #
 ROBOT_NEUTRAL = {"left": np.array([-0.22, 0.02, 0.46]),
                  "right": np.array([0.22, 0.02, 0.46])}
+ROBOT_REST = {"left": np.array([-0.221, -0.437, -0.032]),
+              "right": np.array([0.222, -0.440, 0.032])}
+POSE_A = {"left": np.array([-0.18, 0.10, 0.42]), "right": np.array([0.18, 0.10, 0.42])}
+POSE_B = {"left": np.array([-0.16, -0.45, 0.05]), "right": np.array([0.16, -0.45, 0.05])}
+POSE_C = {"left": np.array([-0.04, -0.05, 0.30]), "right": np.array([0.04, -0.05, 0.30])}
 
 
-def test_fit_taller_robot_scales_up_reach():
-    """Operator with a shorter reach than the robot's neutral → scale > 1."""
-    op = {"left": np.array([-0.18, 0.05, 0.40]), "right": np.array([0.18, 0.05, 0.40])}
-    r = fit_neutral(op, ROBOT_NEUTRAL)
-    assert r.axis_scale[0] == pytest.approx(0.22 / 0.18, abs=1e-6)      # lateral
-    assert r.axis_scale[2] == pytest.approx(0.46 / 0.40, abs=1e-6)      # reach
-    assert r.axis_scale[1] == r.axis_scale[2]                           # up shares reach
-    # offset: lateral forced to zero; forward fitted exactly by the scale
-    assert r.body_offset[0] == 0.0
-    assert r.body_offset[2] == pytest.approx(0.0, abs=1e-9)
-    # up offset aligns neutrals: rb_u - s*op_u
-    assert r.body_offset[1] == pytest.approx(0.02 - (0.46 / 0.40) * 0.05, abs=1e-6)
-    # the fitted map sends the operator neutral exactly onto the robot neutral
+def _fit(pa=POSE_A, pb=POSE_B, pc=None):
+    return fit_two_pose(pa, pb, ROBOT_NEUTRAL, ROBOT_REST, pose_c=pc)
+
+
+def test_fit_two_pose_scales_from_differences():
+    r = _fit()
+    assert r is not None
+    assert r.axis_scale[0] == pytest.approx(0.44 / 0.36, rel=1e-6)        # spread ratio
+    # up: robot (0.02-(-0.4385))=0.4585 vs operator 0.55; fwd: side-avg 0.46 vs 0.37
+    assert r.axis_scale[1] == pytest.approx(0.4585 / 0.55, rel=1e-3)
+    assert r.axis_scale[2] == pytest.approx(0.46 / 0.37, rel=1e-3)
+    assert r.lat_ref == pytest.approx(0.18, abs=1e-9)
+    assert r.lat_center == pytest.approx(0.0, abs=1e-9)
+    # pose A maps exactly onto the robot neutral (up/fwd via offset)
     for s in SIDES:
-        mapped = r.axis_scale * op[s] + r.body_offset
+        mapped = r.axis_scale * POSE_A[s] + r.body_offset
         np.testing.assert_allclose(mapped[1:], ROBOT_NEUTRAL[s][1:], atol=1e-9)
 
 
-def test_fit_clamps_absurd_scales_and_offsets():
-    op = {"left": np.array([-0.04, 0.0, 0.12]), "right": np.array([0.04, 0.0, 0.12])}
-    r = fit_neutral(op, ROBOT_NEUTRAL)
-    assert np.all(r.axis_scale <= nc.SCALE_MAX + 1e-9)
-    assert np.all(r.axis_scale >= nc.SCALE_MIN - 1e-9)
-    assert np.all(np.abs(r.body_offset) <= nc.OFFSET_MAX + 1e-9)
+def test_fit_two_pose_cancels_recenter_anchor():
+    """THE regression: a recenter/desk-start shifts every measurement by one
+    constant vector (measured 0.5 m). Scales must be identical and the mapped
+    neutral must still land on the robot neutral."""
+    delta = np.array([0.12, -0.50, 0.21])
+    r0 = _fit()
+    r = _fit({s: POSE_A[s] + delta for s in SIDES}, {s: POSE_B[s] + delta for s in SIDES})
+    assert r is not None
+    np.testing.assert_allclose(r.axis_scale, r0.axis_scale, atol=1e-9)
+    assert r.lat_center == pytest.approx(delta[0], abs=1e-9)              # midline absorbed
+    for s in SIDES:
+        m = (POSE_A[s] + delta)
+        mapped_up_fwd = r.axis_scale[1:] * m[1:] + r.body_offset[1:]
+        np.testing.assert_allclose(mapped_up_fwd, ROBOT_NEUTRAL[s][1:], atol=1e-9)
+        lat = r.axis_scale[0] * (m[0] - r.lat_center)                     # mapper lat path
+        assert lat == pytest.approx(ROBOT_NEUTRAL[s][0], abs=1e-9)
 
 
-def test_fit_asymmetric_operator_keeps_midline():
-    """L/R asymmetry in the held pose must average out, never bias one side."""
-    op = {"left": np.array([-0.20, 0.04, 0.42]), "right": np.array([0.16, 0.06, 0.38])}
-    r = fit_neutral(op, ROBOT_NEUTRAL)
-    assert r.body_offset[0] == 0.0
+def test_fit_two_pose_head_yaw_invariant():
+    """The operator watches the dashboard — the body frame is yawed vs the
+    arms. Forward comes from the A−B delta, so the fit must not change."""
+    yaw = np.radians(50.0)
+    c, s_ = np.cos(yaw), np.sin(yaw)
+
+    def yawed(w):
+        x, u, f = w
+        return np.array([c * x + s_ * f, u, -s_ * x + c * f])
+
+    r0 = _fit()
+    r = _fit({s: yawed(POSE_A[s]) for s in SIDES}, {s: yawed(POSE_B[s]) for s in SIDES})
+    assert r is not None
+    np.testing.assert_allclose(r.axis_scale, r0.axis_scale, atol=1e-6)
+    assert r.lat_ref == pytest.approx(r0.lat_ref, abs=1e-6)
+
+
+def test_fit_two_pose_rejects_degenerate():
+    assert _fit(POSE_A, POSE_A) is None                       # no A-B delta
+    bad_spread = {"left": np.array([-0.05, 0.1, 0.42]), "right": np.array([0.05, 0.1, 0.42])}
+    assert _fit(bad_spread, POSE_B) is None                   # hands too close in A
+
+
+def test_fit_pose_c_anchors_contact_and_midline():
+    """Pose C (palms together): the measured clap gap maps to the robot contact
+    gap, the midline is measured where the palms meet, and the curve still hits
+    the robot spread at the pose-A spread."""
+    r = _fit(pc=POSE_C)
+    assert r is not None and r.lat_knots is not None
+    (xc, yc), (xa, ya) = r.lat_knots
+    assert xc == pytest.approx(0.04, abs=1e-9)               # operator clap half-gap
+    assert yc == pytest.approx(0.06, abs=1e-9)               # robot contact half-gap
+    assert xa == pytest.approx(0.18, abs=1e-9)
+    assert ya == pytest.approx(0.22, abs=1e-9)
+    assert r.lat_center == pytest.approx(0.0, abs=1e-9)
+    assert r.forward_body is not None
+
+
+def test_fit_pose_c_anchor_shift_still_cancels():
+    delta = np.array([0.12, -0.50, 0.21])
+    r = _fit({s: POSE_A[s] + delta for s in SIDES}, {s: POSE_B[s] + delta for s in SIDES},
+             {s: POSE_C[s] + delta for s in SIDES})
+    assert r is not None and r.lat_knots is not None
+    assert r.lat_center == pytest.approx(delta[0], abs=1e-9)
+    (xc, yc), (xa, ya) = r.lat_knots
+    assert xc == pytest.approx(0.04, abs=1e-9) and xa == pytest.approx(0.18, abs=1e-9)
+
+
+def test_fit_absorbs_meter_scale_stream_anchor_mismatch():
+    """THE 2026-06-11 regression, real captured poses: ORBIT's wrist and head
+    streams recenter-anchor INDEPENDENTLY — the wrists measured ~1.35 m above
+    the torso proxy for the whole session. The old ±0.8 m offset clip silently
+    truncated the fitted up-offset (needed −2.19 m) and every runtime target
+    landed ~1.4 m above the chest: arms pinned at the workspace ceiling. The
+    offset must absorb the anchor EXACTLY — pose A maps onto the robot
+    neutral, unclipped."""
+    pa = {"left": np.array([-0.189, 1.492, 0.1353]),
+          "right": np.array([0.196, 1.5033, 0.1543])}
+    pb = {"left": np.array([-0.2541, 1.1824, -0.2473]),
+          "right": np.array([0.2611, 1.1917, -0.2302])}
+    pc = {"left": np.array([-0.0351, 1.3494, -0.1041]),
+          "right": np.array([0.0498, 1.3484, -0.0981])}
+    r = fit_two_pose(pa, pb, ROBOT_NEUTRAL, ROBOT_REST, pose_c=pc)
+    assert r is not None
+    assert r.body_offset[1] < -1.5                       # NOT clipped to −0.8
+    A = {s: np.array(r.meta["pose_a"][s]) for s in SIDES}    # fit-frame pose A
+    # The MEAN of pose A maps onto the robot neutral exactly; per-side
+    # residuals are the operator's own asymmetry (~1 cm here), not anchor.
+    mapped = {s: r.axis_scale * A[s] + r.body_offset for s in SIDES}
+    mean_mapped = np.mean([mapped[s] for s in SIDES], axis=0)
+    mean_neutral = np.mean([ROBOT_NEUTRAL[s] for s in SIDES], axis=0)
+    np.testing.assert_allclose(mean_mapped[1:], mean_neutral[1:], atol=1e-3)
+    for s in SIDES:
+        np.testing.assert_allclose(mapped[s][1:], ROBOT_NEUTRAL[s][1:], atol=0.02)
 
 
 # --------------------------------------------------------------------------- #
 # persistence
 # --------------------------------------------------------------------------- #
 def test_save_load_round_trip(tmp_path):
-    r = fit_neutral({"left": np.array([-0.18, 0.05, 0.40]),
-                     "right": np.array([0.18, 0.05, 0.40])}, ROBOT_NEUTRAL)
+    r = _fit()
     p = tmp_path / "calib.json"
     r.save(p)
     back = load_calibration(p)
     assert back is not None
     np.testing.assert_allclose(back.axis_scale, r.axis_scale, atol=1e-9)
     np.testing.assert_allclose(back.body_offset, r.body_offset, atol=1e-9)
+    assert back.lat_ref == pytest.approx(r.lat_ref, abs=1e-9)
+    assert back.lat_center == pytest.approx(r.lat_center, abs=1e-9)
 
 
 def test_load_rejects_garbage(tmp_path):
@@ -85,8 +171,11 @@ def test_load_rejects_garbage(tmp_path):
     assert load_calibration(p) is None                       # corrupt
     p.write_text(json.dumps({"axis_scale": [9.0, 1.0, 1.0], "body_offset": [0, 0, 0]}))
     assert load_calibration(p) is None                       # out-of-range scale
-    p.write_text(json.dumps({"axis_scale": [1.0, 1.0, 1.0], "body_offset": [0, 0.9, 0]}))
+    p.write_text(json.dumps({"axis_scale": [1.0, 1.0, 1.0], "body_offset": [0, 10.5, 0]}))
     assert load_calibration(p) is None                       # out-of-range offset
+    # a real wrist↔head stream anchor mismatch (measured −2.19 m) must load
+    p.write_text(json.dumps({"axis_scale": [1.0, 1.0, 1.0], "body_offset": [0, -2.19, 0]}))
+    assert load_calibration(p) is not None
 
 
 # --------------------------------------------------------------------------- #
@@ -158,7 +247,7 @@ def test_mapper_set_calibration_releases_anchor():
 
 
 # --------------------------------------------------------------------------- #
-# capture state machine
+# capture state machine (two-pose)
 # --------------------------------------------------------------------------- #
 def _rig():
     return load_rig()
@@ -175,29 +264,67 @@ def _drive(npc: NeutralPoseCalibration, w_left, w_right, t0, t1, hz=30.0):
     return t
 
 
-def test_capture_completes_on_still_extended_pose():
+def _drive_two_pose(npc, pa=POSE_A, pb=POSE_B, pc=POSE_C, t0=0.0):
+    # Capture order: rest → clap → extended-forward LAST.
+    t = _drive(npc, pb["left"], pb["right"], t0, t0 + 8.0)
+    if npc.phase != "wait_clap":
+        return t
+    t = _drive(npc, pc["left"], pc["right"], t + 0.1, t + 12.0)
+    if npc.phase != "wait_fwd":
+        return t
+    return _drive(npc, pa["left"], pa["right"], t + 0.1, t + 24.0)
+
+
+def test_capture_completes_three_poses():
     npc = NeutralPoseCalibration(_rig())
     npc.start(0.0)
-    t_end = _drive(npc, [-0.18, 0.05, 0.40], [0.18, 0.05, 0.40], 0.0, 10.0)
+    t_end = _drive_two_pose(npc)
     assert npc.phase == "done" and npc.result is not None
-    assert t_end < 5.0                                       # window + hold, not the timeout
-    assert npc.result.axis_scale[2] == pytest.approx(0.46 / 0.40, rel=1e-3)
+    assert t_end < 30.0
+    assert npc.result.axis_scale[0] == pytest.approx(0.44 / 0.36, rel=1e-3)
+    assert npc.result.lat_knots is not None
 
 
-def test_capture_rejects_arms_down_and_crossed():
+def test_capture_with_recentered_anchor_completes():
+    """The measured failure: a desk-start shifted everything ~0.5 m and the old
+    absolute pose gate refused forever. The pose gates are relative."""
+    delta = np.array([0.1, -0.5, 0.2])
     npc = NeutralPoseCalibration(_rig())
     npc.start(0.0)
-    _drive(npc, [-0.20, -0.45, 0.05], [0.20, -0.45, 0.05], 0.0, 6.0)   # ragdoll hang
-    assert npc.active and npc.phase == "wait"
-    _drive(npc, [0.10, 0.0, 0.40], [-0.10, 0.0, 0.40], 6.0, 12.0)      # crossed hands
-    assert npc.active and npc.phase == "wait"
+    _drive(npc, POSE_B["left"] + delta, POSE_B["right"] + delta, 0.0, 8.0)
+    assert npc.phase == "wait_clap", "rest pose refused under anchor shift"
+    _drive(npc, POSE_C["left"] + delta, POSE_C["right"] + delta, 8.1, 20.0)
+    assert npc.phase == "wait_fwd"
+    _drive(npc, POSE_A["left"] + delta, POSE_A["right"] + delta, 20.2, 32.0)
+    assert npc.phase == "done" and npc.result is not None
+    assert npc.result.lat_center == pytest.approx(0.1, abs=1e-3)
+
+
+def test_capture_pose_fwd_requires_arm_raise():
+    """Holding the rest pose again at step 3/3 must not complete — the
+    extended pose needs the wrists RAISED ≥ DROP_MIN above the rest pose."""
+    npc = NeutralPoseCalibration(_rig())
+    npc.start(0.0)
+    _drive(npc, POSE_B["left"], POSE_B["right"], 0.0, 8.0)
+    assert npc.phase == "wait_clap"
+    _drive(npc, POSE_C["left"], POSE_C["right"], 8.1, 20.0)
+    assert npc.phase == "wait_fwd"
+    _drive(npc, POSE_B["left"], POSE_B["right"], 20.2, 28.0)
+    assert npc.active and npc.phase == "wait_fwd"            # still waiting for the raise
+
+
+def test_capture_rejects_crossed_or_narrow_hands():
+    npc = NeutralPoseCalibration(_rig())
+    npc.start(0.0)
+    _drive(npc, [0.02, 0.1, 0.40], [-0.02, 0.1, 0.40], 0.0, 6.0)   # crossed/narrow
+    assert npc.active and npc.phase == "wait_rest"
 
 
 def test_capture_waits_for_both_hands():
     npc = NeutralPoseCalibration(_rig())
     npc.start(0.0)
-    _drive(npc, [-0.18, 0.05, 0.40], None, 0.0, 6.0)
-    assert npc.active and npc.phase == "wait"
+    _drive(npc, POSE_B["left"], None, 0.0, 6.0)
+    assert npc.active and npc.phase == "wait_rest"
     st = npc.status(6.0)
     assert st["left"] and not st["right"]
 
@@ -205,13 +332,10 @@ def test_capture_waits_for_both_hands():
 def test_capture_motion_resets_hold():
     npc = NeutralPoseCalibration(_rig())
     npc.start(0.0)
-    # still for 1.5 s (less than HOLD_S) …
-    _drive(npc, [-0.18, 0.05, 0.40], [0.18, 0.05, 0.40], 0.0, 1.5)
+    _drive(npc, POSE_B["left"], POSE_B["right"], 0.0, 1.5)
     assert npc.active
-    # … then a SUSTAINED 8 cm shift (a single-sample glitch is tolerated by
-    # design — the window std absorbs it; real motion must reset the hold)
-    _drive(npc, [-0.18, 0.13, 0.40], [0.18, 0.05, 0.40], 1.5 + 1 / 30, 1.8)
-    assert npc._hold_t0 is None                    # mixed window → not still → hold reset
+    _drive(npc, POSE_B["left"] + [0, 0.08, 0], POSE_B["right"], 1.5 + 1 / 30, 1.8)
+    assert npc._hold_t0 is None
     assert npc.active
 
 
@@ -221,6 +345,19 @@ def test_capture_timeout_cancels():
     npc.tick({"left": None, "right": None}, nc.TIMEOUT_S + 1.0)
     assert not npc.active and npc.phase == "cancelled"
     assert "timed out" in npc.status(nc.TIMEOUT_S + 1.0)["msg"]
+
+
+def test_status_prompts_walk_the_operator():
+    npc = NeutralPoseCalibration(_rig())
+    npc.start(0.0)
+    npc.tick({"left": POSE_B["left"], "right": POSE_B["right"]}, 0.0)
+    assert "1/3" in npc.status(0.0)["msg"] or "RELAX" in npc.status(0.0)["msg"]
+    t = _drive(npc, POSE_B["left"], POSE_B["right"], 0.0, 8.0)
+    assert npc.phase == "wait_clap"
+    assert "2/3" in npc.status(t)["msg"]
+    t = _drive(npc, POSE_C["left"], POSE_C["right"], t + 0.1, t + 12.0)
+    assert npc.phase == "wait_fwd"
+    assert "3/3" in npc.status(t)["msg"]
 
 
 # --------------------------------------------------------------------------- #
@@ -258,15 +395,23 @@ def test_engine_capture_freezes_arms_applies_and_persists(tmp_path):
     calib_path = tmp_path / "operator_calib.json"
     rig["mapping"]["calib_file"] = str(calib_path)
     rig["mapping"]["swap_sides"] = False   # this test pins per-side capture, not the operator swap
+    # This fixture TELEPORTS between poses (real operators glide); the anchor
+    # guard would rightly read that as an anchor event. Capture mechanics are
+    # the subject here — guard/capture interplay is pinned in test_anchor_guard.
+    rig["safety"]["anchor_guard"] = {"enabled": False}
     sink = DummySink()
     eng = TeleopEngine(rig, sink)
     assert eng.calib_summary is None
     q_before = {s: eng.arm[s].ik.q.copy() for s in SIDES}
 
     eng.request_calibration()
-    w = {"left": [-0.18, 0.05, 0.40], "right": [0.18, 0.05, 0.40]}
+    wa = {"left": POSE_A["left"].tolist(), "right": POSE_A["right"].tolist()}
+    wb = {"left": POSE_B["left"].tolist(), "right": POSE_B["right"].tolist()}
+    wc = {"left": POSE_C["left"].tolist(), "right": POSE_C["right"].tolist()}
     t, dt = 0.0, 1.0 / 30.0
-    while t < 10.0:
+    while t < 30.0:
+        ph = eng.neutral.phase
+        w = wb if (ph == "wait_rest" or t < 0.1) else (wc if ph == "wait_clap" else wa)
         eng.tick(_frame_with_wrist_body(w, t), {"left": True, "right": True}, t)
         if eng.calib_summary is not None:
             break
@@ -277,32 +422,71 @@ def test_engine_capture_freezes_arms_applies_and_persists(tmp_path):
     assert eng.calib_summary is not None, "capture never completed"
     assert calib_path.exists()
     for s in SIDES:
-        assert eng.arm[s].mapper.axis_scale[2] == pytest.approx(0.46 / 0.40, rel=1e-3)
+        assert eng.arm[s].mapper.axis_scale[0] == pytest.approx(0.44 / 0.36, rel=1e-3)
     # banner: done message present, then fades after 2.5 s of normal ticks
     assert eng.calib_status and eng.calib_status["phase"] == "done"
     for _ in range(int(3.0 / dt)):
         t += dt
-        eng.tick(_frame_with_wrist_body(w, t), {"left": True, "right": True}, t)
+        eng.tick(_frame_with_wrist_body(wb, t), {"left": True, "right": True}, t)
     assert eng.calib_status is None
 
 
-def test_engine_autoloads_for_live_transport_only(tmp_path):
+def test_engine_yaw_latch_skips_degenerate_head_samples():
+    """A NaN warm-up or looking-straight-down head must NOT latch the session
+    yaw frame — a degenerate latch poisons every body-relative sample after it
+    (a real replay's first head sample is NaN; a real session's first sample
+    can be the operator looking down at the desk). Until a sane head arrives
+    the engine fails closed: samples come back untracked."""
+    eng = TeleopEngine(load_rig(), DummySink())
+    assert not TeleopEngine._head_latchable(np.full((4, 4), np.nan))
+    down = np.eye(4)        # camera −Z pointing straight down → no horizontal fwd
+    down[:3, :3] = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]], dtype=float).T
+    assert not TeleopEngine._head_latchable(down)
+    hs = HandSample(tracked=True, wrist=np.eye(4), landmarks=None, pinch=0.0)
+    out = eng._arm_hand_sample(hs, VRFrame(stamp=0.0, head=down,
+                                           hands={"left": hs, "right": hs}))
+    assert out is not None and not out.tracked           # fail closed, no latch
+    assert eng._yaw_R is None
+    out = eng._arm_hand_sample(hs, VRFrame(stamp=0.1, head=np.eye(4),
+                                           hands={"left": hs, "right": hs}))
+    assert eng._yaw_R is not None and out.tracked        # sane head latches
+
+
+def test_engine_calibration_required_locks_live_transports(tmp_path):
+    """SAFETY: with require_calibration (default), a live transport must NOT
+    auto-load an old fit and must NOT follow hands until an in-session
+    calibration completes — a fresh ORBIT recenter anchor invalidates any
+    previous absolute fit."""
     calib_path = tmp_path / "operator_calib.json"
-    fit_neutral({"left": np.array([-0.18, 0.05, 0.40]),
-                 "right": np.array([0.18, 0.05, 0.40])}, ROBOT_NEUTRAL).save(calib_path)
+    _fit().save(calib_path)
     rig = load_rig()
     rig["mapping"]["calib_file"] = str(calib_path)
     rig["vr"]["transport"] = "fake"
     assert TeleopEngine(rig, DummySink()).calib_summary is None      # gate stays deterministic
     rig["vr"]["transport"] = "orbit"
     eng = TeleopEngine(rig, DummySink())
-    assert eng.calib_summary is not None                             # live session restores fit
-    eng.request_calibration_clear()
-    eng.tick(None, {}, 0.0)
-    assert eng.calib_summary is None
-    assert not calib_path.exists()
+    assert eng.calib_summary is None                                 # no stale auto-load
+    assert eng.follow_locked                                         # arms locked
+    q0 = {s: eng.arm[s].ik.q.copy() for s in SIDES}
+    t = 0.0
+    for _ in range(120):                                             # hands wave; arms must hold
+        t += 1 / 60
+        eng.tick(_frame_with_wrist_body({"left": [-0.2, 0.1 * np.sin(t * 3), 0.4],
+                                         "right": [0.2, 0.1 * np.cos(t * 3), 0.4]}, t),
+                 {"left": True, "right": True}, t)
     for s in SIDES:
-        np.testing.assert_allclose(eng.arm[s].mapper.axis_scale, np.ones(3))
+        assert float(np.linalg.norm(eng.arm[s].ik.q - q0[s])) < 1e-9, "locked arm moved"
+    # legacy opt-out still auto-loads
+    rig2 = load_rig()
+    rig2["mapping"]["calib_file"] = str(calib_path)
+    rig2["vr"]["transport"] = "orbit"
+    rig2["vr"]["require_calibration"] = False
+    eng2 = TeleopEngine(rig2, DummySink())
+    assert eng2.calib_summary is not None and not eng2.follow_locked
+    eng2.request_calibration_clear()
+    eng2.tick(None, {}, 0.0)
+    assert eng2.calib_summary is None
+    assert not calib_path.exists()
 
 
 def test_engine_clap_respects_min_separation():
@@ -357,3 +541,4 @@ def test_engine_clap_one_engaged_vs_parked():
     cl, cr = closest_points_segments(parked, tip_l, pw_r, tip_r)
     gap = float(np.linalg.norm(cr - cl))
     assert gap >= d_min - 1e-6
+

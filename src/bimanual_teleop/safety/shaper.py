@@ -7,6 +7,14 @@ stream), the joint command that leaves this object is guaranteed to be:
     software as well as on the Pinocchio model upstream),
   - slower than `rate_limit` rad/s per joint, ALWAYS — a target jump becomes a
     bounded-speed glide, never a snap,
+  - gentler than `accel_limit` rad/s² per joint (when set): velocity RAMPS to
+    the cap and back instead of slamming to it the instant the error is large —
+    the step response is an S-curve, not a rectangle-velocity "blocky" glide.
+    All limits are per SECOND of wall-clock time (scaled by real dt), so the
+    shaped motion is identical at any loop rate — sim and hardware alike.
+    No-overshoot condition: braking from the velocity cap under critically
+    damped tracking peaks at ≈0.37·rate_limit·ω of demanded deceleration, so
+    keep accel_limit comfortably above that (the rig defaults carry ≥1.4×),
   - smooth: a critically-damped second-order tracker (the command-side "PD")
     shapes accelerations, so the motor-side MIT PD receives a continuous,
     overshoot-free reference,
@@ -26,7 +34,8 @@ import numpy as np
 
 
 class JointCommandShaper:
-    def __init__(self, q0, *, rate_limit: float, smooth_hz: float, lo, hi):
+    def __init__(self, q0, *, rate_limit: float, smooth_hz: float, lo, hi,
+                 accel_limit: float | None = None):
         self.lo = np.asarray(lo, dtype=float).reshape(-1)
         self.hi = np.asarray(hi, dtype=float).reshape(-1)
         if not (np.all(np.isfinite(self.lo)) and np.all(np.isfinite(self.hi)) and np.all(self.lo < self.hi)):
@@ -34,6 +43,9 @@ class JointCommandShaper:
         self.rate = float(rate_limit)
         if not (np.isfinite(self.rate) and self.rate > 0):
             raise ValueError("rate_limit must be finite and > 0")
+        self.accel = float(accel_limit) if accel_limit is not None else None
+        if self.accel is not None and not (np.isfinite(self.accel) and self.accel > 0):
+            raise ValueError("accel_limit must be finite and > 0 (or None)")
         omega = 2.0 * np.pi * float(smooth_hz)
         if not (np.isfinite(omega) and omega > 0):
             raise ValueError("smooth_hz must be finite and > 0")
@@ -68,6 +80,8 @@ class JointCommandShaper:
             dt = min(remaining, self.max_dt)
             remaining -= dt
             a = self.kp * (tgt - self.q) - self.kd * self.v
+            if self.accel is not None:
+                a = np.clip(a, -self.accel, self.accel)
             self.v = np.clip(self.v + a * dt, -self.rate, self.rate)
             self.q = np.clip(self.q + self.v * dt, self.lo, self.hi)
         return self.q.copy()

@@ -221,6 +221,7 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>bimanual-teleo
  <span id=conn class="chip bad">stream …</span><span id=hz class=chip>— Hz</span>
  <span id=L class="chip bad">LEFT —</span><span id=R class="chip bad">RIGHT —</span>
  <span id=calib class=chip style="display:none"></span>
+ <span id=wsclamp class=chip style="display:none"></span>
  <span style="flex:1"></span>
  <button class=chip style="cursor:pointer;border:0" onclick="setView(2.48,0.24)">view: behind</button>
  <button class=chip style="cursor:pointer;border:0" onclick="setView(-0.66,0.24)">view: front</button>
@@ -479,6 +480,8 @@ function card(side,s){
   const md=a.motor.measured_deg, cmd=a.q.map(v=>v*57.2958), stale=a.motorAge>2.5;
   const cells=md.map((v,i)=>{const d=v-cmd[i];return `<span style="color:${Math.abs(d)>15?'#ff6b6b':'#9fb2c8'}">${v.toFixed(0)}</span>`}).join(' · ');
   h+=`<div class=kv><span>motor measured ° (vs cmd)${stale?' · stale':''}</span><b style="opacity:${stale?0.5:1}">${cells}</b></div>`}
+ if(a.clamp_dist!=null&&a.clamp_dist>0.005)
+  h+=`<div class=kv><span>target outside workspace</span><b class="${a.clamp_dist>0.02?'err-bad':'err-ok'}">${(a.clamp_dist*100).toFixed(1)} cm</b></div>`;
  return h}
 const TEMP_WARN=58,TEMP_HOT=72;   // °C — tune to the DM motors' over-temp trip
 function tempColor(v){return v>=TEMP_HOT?'#ff6b6b':v>=TEMP_WARN?'#e8b339':'#41d98d'}
@@ -574,10 +577,13 @@ $('btnAnalyze').onclick=async()=>{const f=$('selRec').value;if(!f)return;
   o.style.color=r.error?'#e8b339':(r.ok?'#41d98d':'#ff8a8a');o.title=r.detail||'';
  }catch(e){o.textContent='⚠ analyze failed'}};
 let CAL_ACTIVE=false;
+let WSEMA={left:0,right:0};
 $('btnCalib').onclick=()=>control({action:CAL_ACTIVE?'calibrate_cancel':'calibrate'});
 $('btnCalClear').onclick=()=>control({action:'calibrate_clear'});
 function updCalib(st){
  const c=st&&st.status?st.status.calib:null, applied=st&&st.status?st.status.calib_applied:null;
+ const locked=!!(st&&st.status&&st.status.follow_locked);
+ const g=st&&st.status?st.status.guard:null, tripped=!!(g&&g.tripped);
  CAL_ACTIVE=!!(c&&c.active);
  const btn=$('btnCalib');
  btn.textContent=CAL_ACTIVE?'✕ CANCEL CAL':'⊕ CALIBRATE';
@@ -586,16 +592,30 @@ function updCalib(st){
  if(c&&c.active){
   bn.style.display='flex';
   $('calMsg').textContent=c.msg||'';
+  $('calMsg').style.color='';
   $('calBar').style.width=((c.progress||0)*100).toFixed(0)+'%';
   for(const[side,id]of[['left','calL'],['right','calR']])
    chip(id,c[side]?'ok':'bad',(side==='left'?'LEFT ':'RIGHT ')+(c[side]?'✓ in view':'not tracked'));
+ }else if(locked){
+  bn.style.display='flex';
+  $('calMsg').textContent=tripped
+   ?'⚠ '+((c&&c.phase==='tripped'&&c.msg)||('TRACKING JUMPED — '+((g&&g.reason)||'anchor changed')+'. Recalibrate to resume.'))
+   :'ARMS LOCKED — press ⊕ CALIBRATE and follow the 3 poses to enable control (required each session)';
+  $('calMsg').style.color=tripped?'#ff8a8a':'';
+  $('calBar').style.width='0%';
+  chip('calL','warn','LEFT —');chip('calR','warn','RIGHT —');
  }else bn.style.display='none';
  // header chip: transient msgs (done/cancelled fade engine-side) or the applied fit
  const hc=$('calib');
- if(c&&c.msg&&!c.active){hc.style.display='';hc.className='chip '+(c.phase==='done'?'ok':'warn');hc.textContent=c.msg}
- else if(applied&&applied.axis_scale){hc.style.display='';hc.className='chip ok';
-  hc.title='body offset [r,u,f]: '+JSON.stringify(applied.body_offset);
-  hc.textContent='CAL ✓ lat ×'+applied.axis_scale[0].toFixed(2)+' / reach ×'+applied.axis_scale[2].toFixed(2)}
+ if(c&&c.phase==='tripped'&&!c.active){hc.style.display='';hc.className='chip bad';hc.textContent='⚠ TRACKING TRIP'+(g&&g.trips>1?' ×'+g.trips:'')}
+ else if(c&&c.msg&&!c.active){hc.style.display='';hc.className='chip '+(c.phase==='done'?'ok':'warn');hc.textContent=c.msg}
+ else if(applied&&applied.axis_scale){
+  const q=applied.quality||null,gr=q?q.grade:null;
+  hc.style.display='';hc.className='chip '+(gr==='bad'?'bad':gr==='check'?'warn':'ok');
+  hc.title='body offset [r,u,f]: '+JSON.stringify(applied.body_offset)
+    +(q&&q.reasons&&q.reasons.length?' · fit: '+q.reasons.join('; '):'');
+  hc.textContent='CAL '+(gr==='bad'?'✗':gr==='check'?'⚠':'✓')+' lat ×'+applied.axis_scale[0].toFixed(2)
+    +' / reach ×'+applied.axis_scale[2].toFixed(2)+(q&&q.worst_cm!=null?' · ±'+q.worst_cm+'cm':'')}
  else if(c&&c.msg){hc.style.display='';hc.className='chip warn';hc.textContent='calib: '+c.msg}
  else hc.style.display='none';
  $('btnCalClear').style.display=(applied&&!CAL_ACTIVE)?'':'none';
@@ -634,6 +654,13 @@ async function tick(){
    for(const[side,id]of[['left','L'],['right','R']]){
     const tr=s.status.tracked[side],en=s.status.engaged[side];
     chip(id,tr?(en?'ok':'warn'):'bad',`${id==='L'?'LEFT':'RIGHT'} ${tr?(en?'tracked + engaged':'tracked'):'NO TRACKING'}`)}
+   // sustained workspace clamping = the mapping/calibration is off (EMA ~1s)
+   for(const side of['left','right']){const a=s.arms?s.arms[side]:null;
+    WSEMA[side]=0.95*WSEMA[side]+0.05*((a&&a.clamp_dist>0.02)?1:0)}
+   const wsworst=Math.max(WSEMA.left,WSEMA.right),wc=$('wsclamp');
+   if(wsworst>0.5){wc.style.display='';wc.className='chip bad';
+    wc.textContent='WS CLAMP '+(WSEMA.left>0.5?'L':'')+(WSEMA.right>0.5?'R':'')+' — mapping off? recalibrate'}
+   else wc.style.display='none';
    updCalib(s);
    drawHands(s);drawRobot(s,d.mesh_T,d.hand_mesh,d.hand_T);drawOverlay(s,d.mesh_T,d.hand_mesh,d.hand_T);
    $('cardL').innerHTML=card('left',s);$('cardR').innerHTML=card('right',s);
@@ -1062,9 +1089,11 @@ class EngineManager:
             self.last_msg = f"jog failed: {e}"
         return self.status()
 
-    def start_live(self):
+    def start_live(self, clutch: str = "always"):
+        clutch = clutch if clutch in ("always", "gesture") else "always"
         rec = f"recordings/live_{time.strftime('%m%d_%H%M%S')}.npz"
-        return self._start(["--vr", "orbit", "--clutch", "always", "--record", rec], "LIVE", rec)
+        return self._start(["--vr", "orbit", "--clutch", clutch, "--record", rec],
+                           f"LIVE ({clutch})", rec)
 
     def start_live_hw(self):
         """LIVE Quest → REAL ROBOT teleop (run_hw --vr orbit). GESTURE clutch: the
@@ -1244,7 +1273,7 @@ class EngineManager:
                 j = -1
             return self.flip_sign(side, j)
         if action == "start_live":
-            return self.start_live()
+            return self.start_live((query.get("clutch") or ["always"])[0])
         if action == "start_live_hw":
             return self.start_live_hw()
         if action == "start_replay":

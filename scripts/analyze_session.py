@@ -33,7 +33,7 @@ from bimanual_teleop.config import SIDES, load_rig                  # noqa: E402
 from bimanual_teleop.engine import TeleopEngine                     # noqa: E402
 from bimanual_teleop.vr.calibrate import W_AXES, head_op_axes       # noqa: E402
 from bimanual_teleop.vr.frames import (                             # noqa: E402
-    quat_from_axis_angle, quat_to_R, rotvec, swing_twist_angle)
+    SE3, quat_from_axis_angle, quat_to_R, rotvec, swing_twist_angle)
 from bimanual_teleop.vr.replay import ReplaySource                  # noqa: E402
 
 
@@ -64,6 +64,8 @@ def main() -> int:
                     help="only score frames where the hand has rotated at least this many deg from anchor")
     ap.add_argument("--calib-seconds", type=float, default=None,
                     help="override vr.calib_seconds (default: rig value, i.e. what a live session does)")
+    ap.add_argument("--no-calib", action="store_true",
+                    help="score through IDENTITY even when the recording embeds its session fit")
     args = ap.parse_args()
 
     rig = load_rig()
@@ -71,6 +73,14 @@ def main() -> int:
         rig["vr"]["calib_seconds"] = max(0.0, float(args.calib_seconds))
 
     src = ReplaySource(args.path)
+    if src.calib and not args.no_calib:
+        # Score through the calibration that actually RAN during the session:
+        # raw ORBIT frames are only meaningful with their fit (stream anchors
+        # move metres between sessions — identity scoring of a calibrated
+        # session reads as a metre-scale 'mapping error' that never happened).
+        rig["vr"]["_embedded_calib"] = src.calib
+        print(f"applying the session calibration embedded in the recording "
+              f"(stamp {(src.calib.get('meta') or {}).get('stamp', '?')}; --no-calib for identity)")
     t = src.t
     side = args.side
     base_R = quat_to_R(rig["arms"][side]["base_quat"])              # arm base → world
@@ -105,12 +115,24 @@ def main() -> int:
         hs = frame.hands.get(side)
         if frame.head is None or hs is None or not hs.tracked:
             continue
+        # Score in the SAME body frame the engine maps in: the LOCKED session
+        # yaw (vr.body_yaw: locked, the default). Using the live head here
+        # mis-scored every session where the operator looked around — the
+        # prediction rotated with the head while the command (correctly)
+        # did not (measured: a fingers session with the head wandering the
+        # full circle scored 71° of phantom orientation error).
+        if getattr(engine, "_yaw_R", None) is not None:
+            T = np.eye(4)
+            T[:3, :3] = engine._yaw_R
+            op_axes_now = head_op_axes(T)
+        else:
+            op_axes_now = head_op_axes(frame.head)
         if m.anchor_ctrl is not None and m.anchor_ctrl is not prev_anchor_obj:
             prev_anchor_obj = m.anchor_ctrl
             anchor = {
                 "raw_R": np.asarray(hs.wrist, float)[:3, :3].copy(),
                 "raw_p": np.asarray(hs.wrist, float)[:3, 3].copy(),
-                "op_axes": head_op_axes(frame.head),
+                "op_axes": op_axes_now,
                 "ee_R": m.anchor_ee.rotation().as_matrix(),
                 "ee_p": m.anchor_ee.translation(),
                 "t": float(t[i]),
@@ -155,11 +177,11 @@ def main() -> int:
             abs_ori_err = float(np.degrees(np.linalg.norm(rotvec(pred_abs.T @ arm.cmd_R))))
 
         # --- translation ------------------------------------------------------- #
-        # Body-frame torso→wrist vector, recomputed the same way
-        # body_relative_hand_sample does; compared post-hoc via windowed deltas so
-        # the scoring works for both 'absolute' (with its engage glide) and
-        # 'relative' position modes.
-        op_axes = head_op_axes(frame.head)
+        # Body-frame torso→wrist vector, recomputed the same way the ENGINE's
+        # _arm_hand_sample does: LOCKED yaw axes, live head position; compared
+        # post-hoc via windowed deltas so the scoring works for both 'absolute'
+        # (with its engage glide) and 'relative' position modes.
+        op_axes = op_axes_now
         torso_w = frame.head[:3, 3] + op_axes @ np.asarray(rig["vr"]["torso_from_head"], float)
         ctrl_p = op_axes.T @ (W[:3, 3] - torso_w)
         cmd_w = base_R @ arm.cmd_pos + np.asarray(rig["arms"][side]["base_pos"], float)
@@ -264,16 +286,19 @@ def main() -> int:
         ok_pos = True
         print("  hand never displaced >4cm within a window; direction unscored")
     if mode == "absolute":
-        anchor_w = rig["mapping"].get("body_anchor_world")
-        if anchor_w is None:
-            drop = float(rig["mapping"].get("body_anchor_drop", 0.15))
-            anchor_w = 0.5 * (np.asarray(rig["arms"]["left"]["base_pos"], float)
-                              + np.asarray(rig["arms"]["right"]["base_pos"], float)) - [0.0, 0.0, drop]
         settled = [r for r in rows if r["t"] - r["t_engage"] > 2.0 * blend]
         if settled:
-            err = np.array([np.linalg.norm(r["cmd_w"] - (np.asarray(anchor_w) + scale * (W_AXES @ r["ctrl_p"])))
-                            for r in settled])
-            print(f"  absolute correspondence |cmd − (chest + torso→wrist)|: median {np.median(err)*100:5.1f} cm  "
+            # The reference goes through the mapper's OWN body-axes map
+            # (_p_abs: lateral curve + per-axis scale/offset + chest anchor),
+            # so a calibrated session is scored against the calibrated
+            # correspondence. With identity calibration this is byte-identical
+            # to the old `chest + scale·(W_AXES @ torso→wrist)` formula.
+            base_pos = np.asarray(rig["arms"][side]["base_pos"], float)
+            m = arm.mapper
+            err = np.array([np.linalg.norm(
+                r["cmd_w"] - (base_R @ m._p_abs(SE3.from_translation(r["ctrl_p"])) + base_pos))
+                for r in settled])
+            print(f"  absolute correspondence |cmd − map(torso→wrist)|: median {np.median(err)*100:5.1f} cm  "
                   f"p90 {np.percentile(err, 90)*100:5.1f} cm   (post-glide; workspace clamps add to this)")
             ok_pos = ok_pos and np.median(err) < 0.10
     print(f"  VERDICT: {'OK' if ok_pos else 'BROKEN'}")

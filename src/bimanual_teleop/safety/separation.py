@@ -92,18 +92,47 @@ def separate_capsules(w_l: np.ndarray, w_r: np.ndarray, dir_l: np.ndarray, dir_r
         return w_l, w_r
     u_l = np.asarray(dir_l, dtype=float).reshape(3) * length
     u_r = np.asarray(dir_r, dtype=float).reshape(3) * length
+    n_l = u_l / (np.linalg.norm(u_l) + 1e-12)
+    n_r = u_r / (np.linalg.norm(u_r) + 1e-12)
+    # PUSH DIRECTION: the closest-point axis is the true distance gradient, but
+    # for NEAR-PARALLEL overlapping capsules (a full clasp — real hands meet
+    # within ~±30° of parallel) the closest pair sits at staggered points
+    # (fingertip vs palm middle) and that axis tilts into fore/aft+vertical:
+    # the guard then SHEARS the hands past each other instead of stopping them
+    # face to face (measured on a real clap tape: 48% of pushes were majority
+    # shear, p90 ≈ pure shear — the operator sees the hands "cross"). Blend the
+    # axis toward the WRIST-TO-WRIST line as the capsule axes approach
+    # (anti-)parallel: a clasp resolves laterally apart, while a perpendicular
+    # fingertip poke (λ≈0) keeps the gradient axis it genuinely needs.
+    lam = abs(float(n_l @ n_r))
     # Iterate: one distance-based push under-resolves INTERSECTING capsules
-    # (anti-parallel overlap — distance 0 says nothing about depth); each pass
-    # recomputes the closest points after the previous shift and the pair
-    # converges in 2-3 passes.
+    # (anti-parallel overlap — distance 0 says nothing about depth) and a
+    # blended axis is not the exact gradient; each pass recomputes the closest
+    # points after the previous shift and the pair converges in 2-3 passes.
     for _ in range(4):
         c_l, c_r = closest_points_segments(w_l, w_l + u_l, w_r, w_r + u_r)
         d = c_r - c_l
         dist = float(np.linalg.norm(d))
         if dist >= d_min:
             break
-        axis = d / dist if dist > 1e-9 else _FALLBACK_AXIS
+        wd = w_r - w_l
+        wn = float(np.linalg.norm(wd))
         need = d_min - dist
+        if dist > 1e-9:
+            grad = d / dist
+            axis = grad
+            if lam > 0.0 and wn > 1e-9 and float(grad @ (wd / wn)) >= 0.0:
+                axis = (1.0 - lam) * grad + lam * (wd / wn)
+                axis /= (np.linalg.norm(axis) + 1e-12)
+                # the blended axis is not the exact gradient: scale the push so
+                # its gradient COMPONENT closes the full gap (clamped — the
+                # iteration finishes pathological geometries)
+                need /= max(float(axis @ grad), 0.3)
+        else:
+            # Deep intersection: no gradient. The wrist line (anti-cross keeps
+            # it laterally ordered) beats a fixed world axis — e.g. a vertical
+            # clap resolves vertically; world-Y only when wrists coincide too.
+            axis = wd / wn if wn > 1e-9 else _FALLBACK_AXIS
         if move_left and move_right:
             w_l -= axis * (need / 2.0)
             w_r += axis * (need / 2.0)

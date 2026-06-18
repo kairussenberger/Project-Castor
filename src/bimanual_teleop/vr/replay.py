@@ -14,10 +14,16 @@ On-disk format (.npz):
     t[N], head[N,4,4]  (NaN where the frame had no headset pose);
     per side:  {side}_wrist[N,4,4], {side}_tracked[N] bool, {side}_pinch[N],
                {side}_landmarks[N,25,3]  (NaN where the hand had no landmarks);
-    engaged[N,2] bool in SIDES order.
+    engaged[N,2] bool in SIDES order;
+    calib_json[()] str (optional) — the neutral-pose calibration that was
+    APPLIED while recording (CalibResult.payload()). ORBIT stream anchors
+    differ per session by metres (measured 2026-06-12: consecutive sessions
+    fitted offsets ~1 m apart), so raw frames are only meaningful together
+    with their session's fit: replay/analyze apply it automatically.
 """
 from __future__ import annotations
 
+import json
 import os
 import time
 from pathlib import Path
@@ -46,7 +52,7 @@ class SessionRecorder:
         self._frames.append(frame)
         self._engaged.append({s: bool(engaged.get(s, False)) for s in SIDES})
 
-    def save(self, path) -> str:
+    def save(self, path, calib: dict | None = None) -> str:
         n = len(self._t)
         cols: dict[str, np.ndarray] = {
             "t": np.asarray(self._t, float),
@@ -75,6 +81,8 @@ class SessionRecorder:
             cols[f"{s}_tracked"] = np.asarray(tracked, bool)
             cols[f"{s}_pinch"] = np.asarray(pinch, float)
             cols[f"{s}_landmarks"] = np.stack(lms) if n else np.empty((0, _N_LM, 3))
+        if calib is not None:
+            cols["calib_json"] = np.array(json.dumps(calib))   # 0-d unicode, pickle-free
         if isinstance(path, (str, bytes, os.PathLike)):
             p = Path(path)
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -95,6 +103,14 @@ class ReplaySource:
         self.t = np.asarray(d["t"], float)
         self.head = np.asarray(d["head"], float)
         self.engaged_arr = np.asarray(d["engaged"], bool)
+        # The calibration APPLIED while this session was recorded (None for
+        # older recordings and synthetic fixtures → identity, as before).
+        self.calib: dict | None = None
+        if "calib_json" in d:
+            try:
+                self.calib = json.loads(str(np.asarray(d["calib_json"]).item()))
+            except (json.JSONDecodeError, ValueError):
+                self.calib = None
         self._side = {s: {"wrist": np.asarray(d[f"{s}_wrist"], float),
                           "tracked": np.asarray(d[f"{s}_tracked"], bool),
                           "pinch": np.asarray(d[f"{s}_pinch"], float),

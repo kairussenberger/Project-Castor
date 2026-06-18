@@ -1,6 +1,7 @@
 {
   "arms": {
     "left": {
+      "clamp_dist": 0.0,
       "cmd_pos": [
         0.02496175531370279,
         -0.26638302927267365,
@@ -67,6 +68,7 @@
       ]
     },
     "right": {
+      "clamp_dist": 0.0,
       "cmd_pos": [
         -0.03941759216293649,
         0.1767434251341884,
@@ -461,6 +463,17 @@
     "engaged": {
       "left": true,
       "right": true
+    },
+    "follow_locked": false,
+    "guard": {
+      "enabled": true,
+      "holds": {
+        "left": false,
+        "right": false
+      },
+      "reason": null,
+      "tripped": false,
+      "trips": 0
     },
     "hz": 100.0,
     "tracked": {

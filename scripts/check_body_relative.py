@@ -39,13 +39,20 @@ def pose(R, p) -> np.ndarray:
 
 
 def make_frame(head: np.ndarray, torso_from_head: np.ndarray,
-               torso_to_wrist: dict[str, np.ndarray]) -> VRFrame:
-    op = head_op_axes(head)
+               torso_to_wrist: dict[str, np.ndarray],
+               ref_head: np.ndarray | None = None) -> VRFrame:
+    """Models the REAL ORBIT stream + reconstruction: wrist translations ride
+    the head POSITION (head + keypoint) but NOT the head ROTATION, and wrist
+    attitudes come from the (recenter-yawed) tracker, not the live head. The
+    hand offsets are defined in REF_HEAD's frame: a later head turn or
+    translation leaves the streamed hand values physically unchanged — the
+    SAFETY contract is that this produces ZERO arm input (vr.body_yaw locked).
+    """
+    ref = head if ref_head is None else ref_head
+    op = head_op_axes(ref)
     hands = {}
     for side in SIDES:
-        # RIGID body motion: the hand carries the head's rotation (a real hand
-        # attached to a turning body does), with a PROPER rotation matrix.
-        wrist = pose(head[:3, :3], head[:3, 3] + op @ (torso_from_head + torso_to_wrist[side]))
+        wrist = pose(ref[:3, :3], head[:3, 3] + op @ (torso_from_head + torso_to_wrist[side]))
         hands[side] = HandSample(
             tracked=True,
             wrist=wrist,
@@ -83,11 +90,13 @@ def main() -> int:
     head_moved = pose(euler_to_R([0.0, 0.6, 0.0]), [0.35, 1.72, -0.25])
 
     # First prove the debug/render payload exposes the same body vector independent
-    # of room-space headset translation and yaw.
+    # of room-space headset translation and yaw (with the LOCKED yaw frame the
+    # arm path uses — head rotation must not rotate the display either).
     frame0 = make_frame(head0, torso, base_vec)
-    frame_moved = make_frame(head_moved, torso, base_vec)
-    debug0 = operator_debug_state(frame0, torso)
-    debug_moved = operator_debug_state(frame_moved, torso)
+    frame_moved = make_frame(head_moved, torso, base_vec, ref_head=head0)
+    yaw_R = head0[:3, :3]
+    debug0 = operator_debug_state(frame0, torso, head_R_override=yaw_R)
+    debug_moved = operator_debug_state(frame_moved, torso, head_R_override=yaw_R)
     for side in SIDES:
         assert_close(f"{side} wrist_body initial", debug0["hands"][side]["wrist_body"], base_vec[side], 1e-9)
         assert_close(f"{side} wrist_body moved-head", debug_moved["hands"][side]["wrist_body"], base_vec[side], 1e-9)
@@ -101,8 +110,10 @@ def main() -> int:
         engine.tick(frame0, engaged, i / 120.0)
     p0 = {side: wrist_world(engine, side).copy() for side in SIDES}
 
-    # Move/yaw the headset but keep the torso-to-wrist vector unchanged. The arm
-    # should stay anchored because body-relative mapping cancels whole-body motion.
+    # Move/yaw the headset while the streamed hand values stay physically
+    # unchanged. SAFETY: head motion (looking around, removing the headset)
+    # must be ZERO input — head position cancels in the body-relative
+    # subtraction and head rotation is excluded by the locked yaw frame.
     for i in range(480, 520):
         engine.tick(frame_moved, engaged, i / 120.0)
     p_same = {side: wrist_world(engine, side).copy() for side in SIDES}
@@ -112,7 +123,7 @@ def main() -> int:
             raise AssertionError(f"{side} drifted under pure head/body motion: {drift:.6f} m")
 
     # Lift both wrists relative to the torso. In robot world, this must increase Z.
-    frame_lifted = make_frame(head_moved, torso, lifted_vec)
+    frame_lifted = make_frame(head_moved, torso, lifted_vec, ref_head=head0)
     for i in range(520, 760):
         engine.tick(frame_lifted, engaged, i / 120.0)
     p_lift = {side: wrist_world(engine, side).copy() for side in SIDES}
