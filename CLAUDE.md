@@ -146,6 +146,18 @@ sample selection uses recorded time, but `ReplaySource.latest()` refreshes
 drop valid recordings. `run_teleop --vr replay` uses the recorded engagement
 decisions by default; overriding `--clutch` is for deliberate policy experiments.
 
+To repeat a recording on the REAL arms, `run_hw --vr replay --loop-home` (dashboard:
+RUN ON ROBOT + the `loop+home` toggle) plays the tape, then — when `ReplaySource.exhausted`
+trips — glides the arms back to rest through `glide_arms_home` and `src.rewind()`s for the
+next take. The home transition is a CONTROLLED, ENERGIZED glide: it commands the rest pose
+through the existing `HardwareSink` shaper (never bypasses `safety/shaper.py`, never drops
+the arm limp) and then re-syncs the engine IK and BOTH shapers to rest so the re-armed take
+does not yank the arm back to the replay-end pose. No re-anchor happens between cycles (the
+joint map is untouched); drift correction stays the manual RETURN HOME / RE-ANCHOR path.
+`--home-dwell-s` / `hardware.replay_loop_dwell_s` set the hold at home; `--cycles N` caps
+the run. The loop never re-runs the rest-pose engage gate mid-run because the chain stays
+open for the whole session.
+
 ## Unity Contract
 
 `src/bimanual_teleop/render_sink.py` publishes robot state. Unity consumes the TCP

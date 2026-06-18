@@ -120,6 +120,15 @@ class ReplaySource:
     def duration(self) -> float:
         return float(self.t[-1] - self.t[0]) if len(self.t) else 0.0
 
+    @property
+    def exhausted(self) -> bool:
+        """True once a NON-looping replay has played past its last sample (the
+        recording finished one pass). A looping source never exhausts; an unstarted
+        source has not begun. Drives run_hw's --loop-home: play once, glide home,
+        rewind(), repeat."""
+        return (self._t0_wall is not None and not self.loop and len(self.t) > 0
+                and self._last_replay_t >= float(self.t[-1]))
+
     def _index(self, t: float) -> int:
         """Index of the recorded sample at or just before time t (clamped)."""
         if len(self.t) == 0:
@@ -172,3 +181,10 @@ class ReplaySource:
 
     def stop(self) -> None:
         self._t0_wall = None
+
+    def rewind(self) -> None:
+        """Restart the replay from the first recorded frame: the next latest() plays
+        from t[0] again. Also rewinds the RecordedClutch, whose engagement is derived
+        purely from _last_replay_t via current_engaged()."""
+        self._t0_wall = time.monotonic()
+        self._last_replay_t = float(self.t[0]) if len(self.t) else 0.0

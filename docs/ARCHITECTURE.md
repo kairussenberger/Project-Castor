@@ -102,6 +102,8 @@ bound *how fast anything can physically move* no matter what upstream does.
 | Instrumented single nudge (telemetry proof of motion) | `uv run python scripts/probe_nudge.py` |
 | No-robot dashboard test pattern | `uv run python scripts/test_pattern.py` |
 | Replay a recording at reduced speed | `run_hw --vr replay s.npz --speed 0.2 --rate-limit 0.5` |
+| Loop a recording on the real arms (controlled glide home between takes) | `run_hw --vr replay s.npz --loop-home [--cycles N]` (dashboard: RUN ON ROBOT + `loop+home`) |
+| Launch the ORBIT app on the connected Quest (adb) | dashboard `LAUNCH QUEST APP`, or `adb shell monkey -p com.ORBIT.Teleoperation -c android.intent.category.LAUNCHER 1` |
 | Dashboard replay studio (browser: recordings, analyze, speed, STOP ALL) | `uv run python scripts/dashboard.py --host 0.0.0.0` → http://&lt;host&gt;:8180 |
 | Record a headset session | `run_teleop --vr orbit --record recordings/s.npz` |
 | Score a recording vs the contracts | `uv run python scripts/analyze_session.py recordings/s.npz` |

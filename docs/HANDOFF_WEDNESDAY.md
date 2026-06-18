@@ -4,6 +4,31 @@ All work from this session is committed on branch **`dashboard-bringup-tooling`*
 and pushed to `origin`. It is **NOT on `main`** — see "Git state" below before doing
 anything with git. `uv run pytest -q` = **214 passed** on the branch.
 
+## Continuation 2026-06-18 (loop-on-robot + Quest app launcher)
+
+Added after the above, same branch (`uv run pytest -q` now **219 passed**):
+
+- **Loop a replay on the real arms** — `run_hw --vr replay --loop-home` (dashboard:
+  RUN ON ROBOT + the new `loop+home` toggle). Plays the tape, then glides the arms back
+  to rest and replays — the next take WAITS for the home transition. The glide is
+  CONTROLLED + ENERGIZED (commands rest through the existing `HardwareSink` shaper, never
+  drops limp, never bypasses `safety/shaper.py`), then re-syncs the engine IK + both
+  shapers to rest so the re-armed take doesn't yank the arm back to the replay-end pose.
+  No re-anchor between cycles. New: `ReplaySource.exhausted`/`rewind()`
+  (`vr/replay.py`), `glide_arms_home()` + `--loop-home/--home-dwell-s/--cycles`
+  (`launch/run_hw.py`), `hardware.replay_loop_dwell_s` (`rig.yaml`). Tests:
+  `tests/test_replay.py` (exhausted/rewind), `tests/test_replay_loop.py` (glide,
+  hardware-free).
+- **📱 LAUNCH QUEST APP** dashboard button (top toolbar) — runs
+  `adb shell monkey -p com.ORBIT.Teleoperation -c android.intent.category.LAUNCHER 1`
+  to start the ORBIT app on the connected Quest; reports the adb outcome on the status
+  line. **Restart the dashboard process to pick up new buttons** (the HTML is built in
+  `scripts/dashboard.py`; a browser refresh alone won't do it).
+
+**On-metal verify still needed** for `--loop-home`: confirm the home glide is smooth
+across several cycles and watch `out/hw_telemetry.json` motor temps (over-temp on j1 is
+the known risk from below).
+
 ## TL;DR of what shipped
 
 The goal was making the real-hardware bring-up doable entirely from the dashboard,

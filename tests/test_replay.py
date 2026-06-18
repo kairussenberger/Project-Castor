@@ -197,6 +197,41 @@ def test_replay_current_engaged_tracks_latest_sample():
         rs.stop()
 
 
+def test_replay_exhausted_and_rewind():
+    """A non-looping replay reports exhausted once its clock passes the last sample;
+    rewind() restarts it at the top (engagement included). Drives run_hw --loop-home."""
+    import time
+    rs = ReplaySource.from_recorder(_record(n=20, hz=10.0))
+    assert rs.exhausted is False                 # not started yet
+    rs.start()
+    try:
+        rs.latest()
+        assert rs.exhausted is False             # just started, at t[0]
+        rs._t0_wall = time.monotonic() - (rs.duration + 0.5)   # clock past the end
+        rs.latest()
+        assert rs.exhausted is True              # played past the last sample
+        rs.rewind()
+        rs.latest()
+        assert rs.exhausted is False             # back at the top
+        assert rs.current_engaged() == {"left": True, "right": False}   # start-of-tape
+    finally:
+        rs.stop()
+
+
+def test_replay_loop_never_exhausts():
+    """A looping source plays forever — --loop-home's home transition is gated on
+    exhausted, so a loop source must never trip it."""
+    import time
+    rs = ReplaySource.from_recorder(_record(n=20, hz=10.0), loop=True)
+    rs.start()
+    try:
+        rs._t0_wall = time.monotonic() - (rs.duration * 3 + 0.5)
+        rs.latest()
+        assert rs.exhausted is False
+    finally:
+        rs.stop()
+
+
 def test_recorded_clutch_uses_replay_engagement_and_tracking():
     import time
     from bimanual_teleop.safety.clutch import RecordedClutch

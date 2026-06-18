@@ -229,6 +229,7 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>bimanual-teleo
 </header>
 <div class=ctrlbar>
  <button id=btnCanUp class="btn ghost" title="bring up the CAN buses (sudo ip link set canN up type can bitrate 1000000). Needs passwordless sudo for ip, else run it in a terminal.">&#8593; CAN UP</button>
+ <button id=btnQuestApp class="btn ghost" title="launch the ORBIT app (com.ORBIT.Teleoperation) on the connected Quest over adb — needs the headset listed by `adb devices` (USB, authorized). Put the headset on after.">&#128241; LAUNCH QUEST APP</button>
  <button id=btnLive class="btn live" title="LIVE Quest → dashboard/sim only (no robot)">&#9654; START LIVE</button>
  <button id=btnLiveHw class="btn kill" title="LIVE Quest teleop driving the REAL ROBOT (run_hw --vr orbit, gesture clutch — arms follow only while you pinch, rate-limited). Arms at rest, ORBIT app running on the Quest, e-stop in hand.">&#9654; QUEST LIVE TELEOP</button>
  <button id=btnCalib class="btn cal">&#8853; CALIBRATE</button>
@@ -252,6 +253,7 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>bimanual-teleo
  <label class=meta title="mirror motion left↔right only (keeps front/back)"><input type=checkbox id=chkMlr> ↔L/R</label>
  <label class=meta title="mirror motion front↔back only (keeps left/right)"><input type=checkbox id=chkMfb> ↔F/B</label>
  <button id=btnReplay class="btn play sm" title="preview on the dashboard — render only, no robot">&#9654; PREVIEW</button>
+ <label class=meta title="LOOP on the robot: after each pass the arms glide back to home (energized, never limp) and the recording replays — the next take waits for the home transition. STOP releases torque."><input type=checkbox id=chkLoopHw> loop+home</label>
  <button id=btnRobot class="btn kill sm" title="DRIVE THE REAL ARMS with this recording (run_hw, both arms, rate-limited). Arms at rest, e-stop in hand.">&#9654; RUN ON ROBOT</button>
  <button id=btnAnalyze class="btn ghost sm" title="grade this recording against the mapping contracts (no robot)">analyze</button>
  <span id=anaOut class=meta></span>
@@ -488,7 +490,8 @@ const speed=()=>$('spd').value/100;
 function metalCmd(){
  const f=$('selRec').value; if(!f){$('metalCmd').textContent='— pick a recording —';return}
  const sp=speed(), s=sp<1?` --speed ${sp.toFixed(2)}`:'';
- $('metalCmd').textContent=`python -m bimanual_teleop.launch.run_hw --vr replay ${f} --clutch recorded${s} --rate-limit 1.0`;
+ const lh=$('chkLoopHw').checked?' --loop-home':'';
+ $('metalCmd').textContent=`python -m bimanual_teleop.launch.run_hw --vr replay ${f} --clutch recorded${s} --rate-limit 1.0${lh}`;
 }
 async function refreshRec(){
  const f=$('selRec').value, m=$('recMeta');
@@ -518,6 +521,7 @@ function updCtrl(c){
  }
 }
 $('btnCanUp').onclick=()=>control({action:'can_up'});
+$('btnQuestApp').onclick=()=>control({action:'launch_quest'});
 function renderCalib(c){
  if(!c)return; let h='';
  for(const side of ['left','right']){
@@ -552,12 +556,14 @@ $('btnHome').onclick=()=>{
 $('btnReplay').onclick=()=>{const f=$('selRec').value;
  if(f)control({action:'start_replay',file:f,loop:$('chkLoop').checked?'1':'0',speed:speed().toFixed(2),swap:$('chkSwap').checked?'1':'0',mfb:$('chkMfb').checked?'1':'0',mlr:$('chkMlr').checked?'1':'0'})};
 $('btnRobot').onclick=()=>{const f=$('selRec').value; if(!f)return;
- const sp=speed().toFixed(2), sw=$('chkSwap').checked, fb=$('chkMfb').checked, lr=$('chkMlr').checked;
- const tags=(sw?' ⇄arms':'')+(fb?' ↔F/B':'')+(lr?' ↔L/R':'');
- if(!confirm(`⚠ DRIVE THE REAL ROBOT?\n\nRun "${f.split('/').pop()}" on the ACTUAL arms at ${sp}×${tags} (rate-limited 1.0 rad/s, both arms).\n\n• Both arms must be at the resting pose\n• Hand on the e-stop, area clear of people\n\nStarts IDLE, engages via the recorded clutch. Use STOP / STOP ALL to release torque.`)) return;
- control({action:'start_replay_hw',file:f,speed:sp,swap:sw?'1':'0',mfb:fb?'1':'0',mlr:lr?'1':'0'})};
+ const sp=speed().toFixed(2), sw=$('chkSwap').checked, fb=$('chkMfb').checked, lr=$('chkMlr').checked, lh=$('chkLoopHw').checked;
+ const tags=(sw?' ⇄arms':'')+(fb?' ↔F/B':'')+(lr?' ↔L/R':'')+(lh?' ↻loop+home':'');
+ const loopNote=lh?`\n\nLOOPS until STOP: after each pass the arms glide back to home (energized) and replay — the next take waits for that.`:'';
+ if(!confirm(`⚠ DRIVE THE REAL ROBOT?\n\nRun "${f.split('/').pop()}" on the ACTUAL arms at ${sp}×${tags} (rate-limited 1.0 rad/s, both arms).\n\n• Both arms must be at the resting pose\n• Hand on the e-stop, area clear of people\n\nStarts IDLE, engages via the recorded clutch.${loopNote}\n\nUse STOP / STOP ALL to release torque.`)) return;
+ control({action:'start_replay_hw',file:f,speed:sp,swap:sw?'1':'0',mfb:fb?'1':'0',mlr:lr?'1':'0',loop:lh?'1':'0'})};
 $('selRec').onchange=refreshRec;
 $('spd').oninput=()=>{$('spdLbl').innerHTML=speed().toFixed(1)+'&times;';metalCmd()};
+$('chkLoopHw').onchange=metalCmd;
 $('btnMetal').onclick=()=>{const r=$('metalRow');r.style.display=r.style.display==='none'?'flex':'none';metalCmd()};
 $('btnCopyMetal').onclick=()=>{navigator.clipboard.writeText($('metalCmd').textContent);
  $('btnCopyMetal').textContent='copied';setTimeout(()=>$('btnCopyMetal').textContent='copy',1200)};
@@ -953,6 +959,34 @@ class EngineManager:
         self.last_msg = "CAN " + " | ".join(out)
         return self.status()
 
+    def launch_quest(self):
+        """Launch the ORBIT app (com.ORBIT.Teleoperation) on the connected Quest over
+        adb — the same LAUNCHER intent scripts/run_hands.py uses. Needs adb on PATH and
+        the headset listed by `adb devices` (USB, authorized). Reports the outcome on
+        the status line; it does NOT start any teleop process (use QUEST LIVE TELEOP)."""
+        import shutil
+        pkg = "com.ORBIT.Teleoperation"
+        if not shutil.which("adb"):
+            self.last_msg = "QUEST APP: adb not found on PATH — install platform-tools"
+            return self.status()
+        state = subprocess.run(["adb", "get-state"], capture_output=True, text=True)
+        if state.stdout.strip() != "device":
+            why = (state.stdout.strip() or state.stderr.strip() or "no device").splitlines()[0]
+            self.last_msg = f"QUEST APP: headset not ready (adb: {why[:60]}) — connect/authorize the Quest"
+            return self.status()
+        r = subprocess.run(["adb", "shell", "monkey", "-p", pkg,
+                            "-c", "android.intent.category.LAUNCHER", "1"],
+                           capture_output=True, text=True)
+        # `monkey` exits 0 even when the package is absent ("No activities found to run"),
+        # so check the text, not just the return code.
+        blob = (r.stdout + r.stderr).strip()
+        if r.returncode != 0 or "No activities found" in blob or "Error" in blob:
+            hint = blob.splitlines()[-1] if blob else "is the ORBIT app installed?"
+            self.last_msg = f"QUEST APP: launch FAILED — {hint[:80]}"
+        else:
+            self.last_msg = f"QUEST APP: launched {pkg} ✓ — put the headset on"
+        return self.status()
+
     # --- by-hand calibration from the dashboard (arm L/R placement + joint orientation) ---
     def _calib_state(self) -> dict:
         """Current per-side CAN channel + joint signs, for the calibration panel."""
@@ -1067,13 +1101,15 @@ class EngineManager:
         return self._start(args, label, None)
 
     def start_replay_hw(self, file: str, speed: float = 0.25, swap: bool = False,
-                        mfb: bool = False, mlr: bool = False):
+                        mfb: bool = False, mlr: bool = False, loop: bool = False):
         """DRIVE THE REAL ARMS with a recording (run_hw, not the render engine).
-        Always rate-limited and clutch=recorded; NO --loop (run_hw plays the
-        recording once, then PD-holds the last pose until STOP). HardwareSink's
-        rest-pose gate still applies: if the arms are not at the resting pose,
-        run_hw exits at startup and the button row shows the failure. STOP /
-        STOP ALL release torque (run_hw's finally block)."""
+        Always rate-limited and clutch=recorded. Without loop, run_hw plays the
+        recording once then PD-holds the last pose until STOP. With loop (--loop-home),
+        after each pass the arms glide back to home (energized, through the shaper) and
+        the recording replays — the next take waits for the home transition. HardwareSink's
+        rest-pose gate still applies: if the arms are not at the resting pose, run_hw
+        exits at startup and the button row shows the failure. STOP / STOP ALL release
+        torque (run_hw's finally block)."""
         cap = float(load_rig().get("hardware", {}).get("replay_rate_limit", 1.0))
         args = ["--vr", "replay", file, "--clutch", "recorded", "--rate-limit", f"{cap:g}"]
         if speed != 1.0:
@@ -1084,8 +1120,11 @@ class EngineManager:
             args += ["--mirror-fb"]
         if mlr:
             args += ["--mirror-lr"]
+        if loop:
+            args += ["--loop-home"]
         label = (f"ROBOT {Path(file).name}" + (f" @{speed:g}x" if speed != 1.0 else "")
-                 + (" ⇄arms" if swap else "") + (" ↔FB" if mfb else "") + (" ↔LR" if mlr else ""))
+                 + (" ⇄arms" if swap else "") + (" ↔FB" if mfb else "") + (" ↔LR" if mlr else "")
+                 + (" ↻loop" if loop else ""))
         return self._start(args, label, None,
                            module="bimanual_teleop.launch.run_hw", ready_timeout=20.0)
 
@@ -1181,6 +1220,8 @@ class EngineManager:
         action = (query.get("action") or [""])[0]
         if action == "can_up":
             return self.can_up()
+        if action == "launch_quest":
+            return self.launch_quest()
         if action == "get_calib":
             return {**self.status(), "calib": self._calib_state()}
         if action == "swap_channels":
@@ -1228,7 +1269,8 @@ class EngineManager:
                 sp = 0.25
             return self.start_replay_hw(f, sp, (query.get("swap") or ["0"])[0] == "1",
                                         (query.get("mfb") or ["0"])[0] == "1",
-                                        (query.get("mlr") or ["0"])[0] == "1")
+                                        (query.get("mlr") or ["0"])[0] == "1",
+                                        (query.get("loop") or ["0"])[0] == "1")
         if action == "return_home":
             side = (query.get("side") or [""])[0] or None
             return self.return_home(side)
