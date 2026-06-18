@@ -30,7 +30,7 @@ TELEMETRY_PATH = REPO_ROOT / "out" / "hw_telemetry.json"
 
 from ..config import load_rig
 from ..engine import TeleopEngine
-from ..safety.clutch import GestureClutch, RecordedClutch
+from ..safety.clutch import AlwaysOn, GestureClutch, RecordedClutch
 from ..safety.supervisor import Supervisor
 from ..vr.ingest import make_source
 from ..vr.replay import SessionRecorder
@@ -86,8 +86,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--vr", choices=["vuer", "orbit", "fake", "replay"], default="orbit")
     ap.add_argument("replay_path", nargs="?", help="session .npz when --vr replay")
-    ap.add_argument("--clutch", choices=["gesture", "recorded"], default="gesture",
-                    help="hardware engage policy (default: gesture; recorded is for replay sessions)")
+    ap.add_argument("--clutch", choices=["gesture", "recorded", "always"], default="gesture",
+                    help="hardware engage policy. gesture: pinch-to-engage deadman. "
+                         "always: follow continuously once calibrated (NO deadman — e-stop in hand). "
+                         "recorded: replay engage decisions.")
     ap.add_argument("--record", metavar="PATH", default=None,
                     help="write VR frames + engage state to a replayable .npz session")
     ap.add_argument("--hz", type=float, default=None, help="override control rate")
@@ -164,7 +166,14 @@ def main() -> int:
         rig["hardware"]["rate_limit"] = float(args.rate_limit)
         print(f"[hw] shaper rate_limit overridden -> {args.rate_limit:.2f} rad/s")
     src = make_source(rig)
-    clutch = RecordedClutch(src) if args.clutch == "recorded" else GestureClutch()
+    if args.clutch == "recorded":
+        clutch = RecordedClutch(src)
+    elif args.clutch == "always":
+        clutch = AlwaysOn()
+        print("[hw] clutch=always — arms FOLLOW CONTINUOUSLY once calibrated "
+              "(no pinch deadman); keep the e-stop in hand.")
+    else:
+        clutch = GestureClutch()
 
     from ..hardware import HardwareSink
     sink = HardwareSink(rig)

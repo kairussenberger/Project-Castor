@@ -232,7 +232,7 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>bimanual-teleo
  <button id=btnCanUp class="btn ghost" title="bring up the CAN buses (sudo ip link set canN up type can bitrate 1000000). Needs passwordless sudo for ip, else run it in a terminal.">&#8593; CAN UP</button>
  <button id=btnQuestApp class="btn ghost" title="launch the ORBIT app (com.ORBIT.Teleoperation) on the connected Quest over adb — needs the headset listed by `adb devices` (USB, authorized). Put the headset on after.">&#128241; LAUNCH QUEST APP</button>
  <button id=btnLive class="btn live" title="LIVE Quest → dashboard/sim only (no robot)">&#9654; START LIVE</button>
- <button id=btnLiveHw class="btn kill" title="LIVE Quest teleop driving the REAL ROBOT (run_hw --vr orbit, gesture clutch — arms follow only while you pinch, rate-limited). Arms at rest, ORBIT app running on the Quest, e-stop in hand.">&#9654; QUEST LIVE TELEOP</button>
+ <button id=btnLiveHw class="btn kill" title="LIVE Quest teleop driving the REAL ROBOT (run_hw --vr orbit, ALWAYS-ON clutch — arms follow continuously once calibrated, NO pinch deadman, rate-limited). Arms at rest, ORBIT app running on the Quest, E-STOP IN HAND.">&#9654; QUEST LIVE TELEOP</button>
  <button id=btnCalib class="btn cal">&#8853; CALIBRATE</button>
  <button id=btnCalClear class="btn ghost sm" title="clear the applied neutral-pose fit (back to 1:1)" style="display:none">clear cal</button>
  <button id=btnHome class="btn cal" title="Drive the wired arms to the HOME / rest pose (rate-limited) and re-anchor the rest calibration. Arms MOVE — clear of people, e-stop in hand.">&#8962; RETURN HOME</button>
@@ -1096,12 +1096,13 @@ class EngineManager:
                            f"LIVE ({clutch})", rec)
 
     def start_live_hw(self):
-        """LIVE Quest → REAL ROBOT teleop (run_hw --vr orbit). GESTURE clutch: the
-        arms follow only while the operator pinches. Rate-limited; HardwareSink's
-        rest-pose gate applies at start (arms must be at rest); the session is
-        recorded. STOP / STOP ALL release torque (run_hw's finally)."""
+        """LIVE Quest → REAL ROBOT teleop (run_hw --vr orbit). ALWAYS-ON clutch: the
+        arms follow continuously once calibrated (no pinch deadman — keep the e-stop
+        in hand). Rate-limited; HardwareSink's rest-pose gate applies at start (arms
+        must be at rest); the session is recorded. STOP / STOP ALL release torque
+        (run_hw's finally)."""
         rec = f"recordings/livehw_{time.strftime('%m%d_%H%M%S')}.npz"
-        return self._start(["--vr", "orbit", "--clutch", "gesture", "--rate-limit", "0.5",
+        return self._start(["--vr", "orbit", "--clutch", "always", "--rate-limit", "0.5",
                             "--record", rec], "LIVE→ROBOT", rec,
                            module="bimanual_teleop.launch.run_hw", ready_timeout=20.0)
 
