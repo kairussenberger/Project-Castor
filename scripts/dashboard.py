@@ -189,7 +189,7 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>bimanual-teleo
  header b{font-size:15px;margin-right:8px}
  .chip{padding:4px 12px;border-radius:13px;background:#2a2f38;font-weight:600;font-size:13px}
  .ok{background:#1e5d3a}.bad{background:#7c2d2d}.warn{background:#7a6020}
- main{display:grid;grid-template-columns:minmax(620px,1fr) 350px;gap:14px;padding:14px;max-width:1400px}
+ main{display:grid;grid-template-columns:1fr;gap:14px;padding:14px;max-width:1200px}
  .panel{background:var(--panel);border:1px solid #232936;border-radius:12px;padding:10px 12px}
  .duo{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
  .ptitle{font-size:12.5px;font-weight:700;color:#9fb2c8;letter-spacing:.4px;margin:2px 0 6px}
@@ -229,14 +229,17 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>bimanual-teleo
  <span class=chip id=age>age —</span>
 </header>
 <div class=ctrlbar>
- <button id=btnCanUp class="btn ghost" title="bring up the CAN buses (sudo ip link set canN up type can bitrate 1000000). Needs passwordless sudo for ip, else run it in a terminal.">&#8593; CAN UP</button>
+ <span class=meta style="font-weight:700;color:#9fb2c8;letter-spacing:.3px">SIM</span>
  <button id=btnQuestApp class="btn ghost" title="launch the ORBIT app (com.ORBIT.Teleoperation) on the connected Quest over adb — needs the headset listed by `adb devices` (USB, authorized). Put the headset on after.">&#128241; LAUNCH QUEST APP</button>
  <button id=btnLive class="btn live" title="LIVE Quest → dashboard/sim only (no robot)">&#9654; START LIVE</button>
- <button id=btnLiveHw class="btn kill" title="LIVE Quest teleop driving the REAL ROBOT (run_hw --vr orbit, ALWAYS-ON clutch — arms follow continuously once calibrated, NO pinch deadman, rate-limited). Arms at rest, ORBIT app running on the Quest, E-STOP IN HAND.">&#9654; QUEST LIVE TELEOP</button>
  <button id=btnCalib class="btn cal">&#8853; CALIBRATE</button>
  <button id=btnCalClear class="btn ghost sm" title="clear the applied neutral-pose fit (back to 1:1)" style="display:none">clear cal</button>
+ <span style="width:1px;align-self:stretch;background:#2a3340;margin:0 5px"></span>
+ <span class=meta style="font-weight:700;color:#9fb2c8;letter-spacing:.3px" title="real-robot controls — arms MOVE, e-stop in hand">HARDWARE</span>
+ <button id=btnCanUp class="btn ghost" title="bring up the CAN buses (sudo ip link set canN up type can bitrate 1000000). Needs passwordless sudo for ip, else run it in a terminal.">&#8593; CAN UP</button>
  <button id=btnHome class="btn cal" title="Drive the wired arms to the HOME / rest pose (rate-limited) and re-anchor the rest calibration. Arms MOVE — clear of people, e-stop in hand.">&#8962; RETURN HOME</button>
- <span style="width:6px"></span>
+ <button id=btnLiveHw class="btn kill" title="LIVE Quest teleop driving the REAL ROBOT (run_hw --vr orbit, ALWAYS-ON clutch — arms follow continuously once calibrated, NO pinch deadman, rate-limited). Arms at rest, ORBIT app running on the Quest, E-STOP IN HAND.">&#9654; QUEST LIVE TELEOP</button>
+ <span style="flex:1"></span>
  <button id=btnStop class="btn stop" title="graceful stop of the dashboard's render engine (saves its recording)">&#9632; STOP</button>
  <button id=btnKill class="btn kill" title="SIGINT every teleop / jog / bring-up / replay process on this host — clean torque release. NOT a substitute for the physical e-stop.">&#9888; STOP ALL</button>
  <span id=ctrlStatus class=meta style="margin-left:6px">…</span>
@@ -265,7 +268,7 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>bimanual-teleo
  <code id=metalCmd class=mono style="flex:1;white-space:nowrap;overflow:auto"></code>
  <button id=btnCopyMetal class="btn ghost sm">copy</button>
 </div>
-<div class=ctrlbar id=calibBar style="flex-wrap:wrap;gap:6px">
+<div class=ctrlbar id=calibBar style="flex-wrap:wrap;gap:6px;display:none">
  <span class=meta style="font-weight:700;color:#9fb2c8;letter-spacing:.3px" title="set the L/R arm placement and each joint's motor direction by hand — no terminal">CALIBRATE</span>
  <button id=btnJog class="btn kill sm" title="JOG mode: ENERGIZE + hold the arms so the −10/+10 buttons move the real motors. Arms at rest, e-stop in hand.">&#9654; JOG hw</button>
  <button id=btnReanchor class="btn cal sm" title="capture the arms' CURRENT limp hang as the rest pose — NO motion. Fixes RETURN HOME / the engage gate after a channel swap. Arms must be hanging at rest.">&#8962; RE-ANCHOR REST</button>
@@ -286,19 +289,11 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>bimanual-teleo
  </div>
 </div>
 <main>
- <div>
-  <div class=duo>
-   <div class=panel><div class=ptitle>YOUR HANDS <span>— Quest joints, torso-relative</span></div>
-    <canvas id=cvH width=460 height=400></canvas></div>
-   <div class=panel><div class=ptitle>ROBOT <span>— real YAM geometry, live</span></div>
-    <canvas id=cvR width=460 height=400></canvas></div>
-  </div>
-  <div class=panel><div class=ptitle>OVERLAY <span>— your hands mapped into robot world (gold) over the robot. drag = orbit, scroll = zoom</span></div>
-   <canvas id=cvO width=952 height=430></canvas></div>
- </div>
- <div>
-  <div class=panel id=cardR style="margin-bottom:14px"></div>
-  <div class=panel id=cardL></div>
+ <div class=duo>
+  <div class=panel><div class=ptitle>YOUR HANDS <span>— your tracked Quest joints, torso-relative</span></div>
+   <canvas id=cvH width=560 height=470></canvas></div>
+  <div class=panel><div class=ptitle>ROBOT + YOUR HANDS <span>— the robot with your hands mapped on (gold). drag = orbit, scroll = zoom</span></div>
+   <canvas id=cvO width=560 height=470></canvas></div>
  </div>
 </main>
 <div class=panel id=logPanel style="margin:0 14px 14px">
@@ -372,7 +367,6 @@ function setView(yaw,pitch){VIEW.yaw=yaw;VIEW.pitch=pitch;}
 // All panels share VIEW (the GIF camera by default). Hands are drawn in the SAME
 // world axes convention as the robot, so the three panels can never disagree.
 const scH=Scene($('cvH'),430,[-0.28,0,0.10]);
-const scR=Scene($('cvR'),300,[-0.1,-0.05,0.82]);
 const scO=Scene($('cvO'),330,[-0.12,-0.05,0.85]);
 function meshInto(s,cam,T,verts,base,alpha){
  const R=[[T[0],T[1],T[2]],[T[4],T[5],T[6]],[T[8],T[9],T[10]]],t=[T[3],T[7],T[11]];
@@ -428,7 +422,6 @@ function drawHands(st){
  }
  flush(scH);
 }
-function drawRobot(st,meshT,hm,hT){clearCv(scR);const cam=camOf(scR);grid(scR,cam,0);robotInto(scR,cam,st,meshT,null,hm,hT);flush(scR)}
 function drawOverlay(st,meshT,hm,hT){
  clearCv(scO);const cam=camOf(scO);grid(scO,cam,0);
  const bases=robotInto(scO,cam,st,meshT,0.85,hm,hT);
@@ -662,8 +655,7 @@ async function tick(){
     wc.textContent='WS CLAMP '+(WSEMA.left>0.5?'L':'')+(WSEMA.right>0.5?'R':'')+' — mapping off? recalibrate'}
    else wc.style.display='none';
    updCalib(s);
-   drawHands(s);drawRobot(s,d.mesh_T,d.hand_mesh,d.hand_T);drawOverlay(s,d.mesh_T,d.hand_mesh,d.hand_T);
-   $('cardL').innerHTML=card('left',s);$('cardR').innerHTML=card('right',s);
+   drawHands(s);drawOverlay(s,d.mesh_T,d.hand_mesh,d.hand_T);
   }
   if(++ctrlN%20===1){try{updCtrl(await(await fetch('/control?action=status')).json())}catch(e){}}
  }catch(e){chip('conn','bad','dashboard error')}
