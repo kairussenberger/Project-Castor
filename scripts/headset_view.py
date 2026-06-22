@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Stream the Mac screen (your dashboard) INTO the Quest's ORBIT app.
+"""Stream the computer screen (your dashboard) INTO the Quest's ORBIT app.
 
 ORBIT renders a video panel in-headset and SUBs for it on tcp://127.0.0.1:10505
 (via adb reverse) — normally fed by a robot camera. Without a stream the panel
@@ -31,9 +31,13 @@ frame is a clean decoder entry point (the app's own config uses gop=1).
     uv run python scripts/headset_view.py --fps 30 --width 1280
     uv run python scripts/headset_view.py --list-screens  # pick a display
 
-First run: grant the terminal Screen Recording permission
-(System Settings → Privacy & Security → Screen Recording), then rerun.
-Requires: ffmpeg (brew install ffmpeg). Ctrl+C to stop.
+macOS: captures via avfoundation + hevc_videotoolbox; first run, grant the
+terminal Screen Recording permission (System Settings → Privacy & Security →
+Screen Recording), then rerun.
+Linux/X11: captures via x11grab, encodes with libx265 (software, default) or
+`--encoder vaapi` (hardware); needs $DISPLAY set (Wayland is unsupported by
+x11grab — use an X11 session).
+Requires: ffmpeg (`brew install ffmpeg` / `sudo apt install ffmpeg`). Ctrl+C to stop.
 """
 from __future__ import annotations
 
@@ -57,6 +61,14 @@ PORT = 10505
 NAL_AUD = 35
 NAL_VPS, NAL_SPS, NAL_PPS = 32, 33, 34
 IDR_TYPES = {19, 20}            # IDR_W_RADL, IDR_N_LP
+
+IS_MAC = sys.platform == "darwin"
+IS_LINUX = sys.platform.startswith("linux")
+
+
+def _env_display() -> str:
+    import os
+    return os.environ.get("DISPLAY", "")
 
 
 def _adb_reverse() -> None:
@@ -93,7 +105,14 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--screen", default=None,
-                    help="avfoundation screen index (default: auto-detect 'Capture screen 0')")
+                    help="macOS: avfoundation screen index (default: auto-detect 'Capture screen 0')")
+    ap.add_argument("--display", default=None,
+                    help="Linux/X11: display+region to grab, e.g. ':1' or ':1+0,0' (default: $DISPLAY)")
+    ap.add_argument("--encoder", default="auto",
+                    choices=["auto", "videotoolbox", "libx265", "vaapi"],
+                    help="HEVC encoder (auto: videotoolbox on macOS, libx265 on Linux)")
+    ap.add_argument("--vaapi-device", default="/dev/dri/renderD128",
+                    help="VAAPI render node when --encoder vaapi")
     ap.add_argument("--list-screens", action="store_true")
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--width", type=int, default=1440,
@@ -106,13 +125,28 @@ def main() -> int:
     args = ap.parse_args()
 
     if not shutil.which("ffmpeg"):
-        print("ffmpeg not found — brew install ffmpeg")
+        print("ffmpeg not found — `brew install ffmpeg` (macOS) or `sudo apt install ffmpeg` (Linux)")
         return 1
+
+    enc = args.encoder
+    if enc == "auto":
+        enc = "videotoolbox" if IS_MAC else "libx265"
+    if not IS_MAC and enc == "videotoolbox":
+        print("[headset-view] hevc_videotoolbox is macOS-only — use --encoder libx265 or vaapi")
+        return 1
+    if IS_MAC and enc != "videotoolbox":
+        print(f"[headset-view] note: {enc} requested on macOS; videotoolbox is the tested path")
+
     if args.list_screens:
-        subprocess.run(["ffmpeg", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
-                       stderr=None)
+        if IS_MAC:
+            subprocess.run(["ffmpeg", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
+                           stderr=None)
+        else:
+            print(f"[headset-view] Linux/X11 grabs a whole display; current $DISPLAY={_env_display()!r}.")
+            subprocess.run(["xrandr"], check=False)
         return 0
-    if args.screen is None:
+
+    if IS_MAC and args.screen is None:
         # Auto-detect: device indices shift with cameras (Desk View, iPhone…) —
         # a hard-coded index once streamed the Desk View camera into the headset.
         out = subprocess.run(["ffmpeg", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
@@ -125,11 +159,17 @@ def main() -> int:
         args.screen = m.group(1)
         print(f"[headset-view] auto-detected screen device index {args.screen}")
 
-    # A wedged capture from a previous run (e.g. killed parent, orphaned ffmpeg)
-    # holds the AVCapture session and starves new captures: zero frames, no
-    # error. Reap our own stale pipelines (signature: avfoundation → raw hevc
-    # on stdout) before starting.
-    subprocess.run(["pkill", "-9", "-f", r"ffmpeg.*avfoundation.*-f hevc -$"],
+    grab_display = args.display or _env_display()
+    if not IS_MAC and not args.lavfi and not grab_display:
+        print("[headset-view] no X display — set $DISPLAY or pass --display :0 (x11grab needs X11; "
+              "Wayland is unsupported)")
+        return 1
+
+    # A wedged capture from a previous run (killed parent, orphaned ffmpeg) holds
+    # the capture device and starves new captures: zero frames, no error. Reap our
+    # own stale pipelines (raw hevc on stdout) before starting.
+    cap_sig = "avfoundation" if IS_MAC else "x11grab"
+    subprocess.run(["pkill", "-9", "-f", rf"ffmpeg.*{cap_sig}.*-f hevc -$"],
                    capture_output=True)
 
     import zmq
@@ -139,26 +179,64 @@ def main() -> int:
     pub.bind(f"tcp://127.0.0.1:{PORT}")
     _adb_reverse()
 
-    # fps first: the avfoundation screen device's timestamps make ffmpeg's CFR
-    # sync duplicate frames (~270/s measured) — drop the dups before encoding.
-    # Then letterbox to one eye and duplicate into both SBS halves (docstring).
+    # fps first: screen-grab timestamps make ffmpeg's CFR sync duplicate frames
+    # (~270/s measured on the avfoundation device) — drop the dups before
+    # encoding. Then letterbox to one eye and duplicate into both SBS halves
+    # (docstring). VAAPI needs the frame as nv12 on the GPU before encoding.
     vf = (f"fps={args.fps},"
           f"scale={args.width}:{args.height}:force_original_aspect_ratio=decrease,"
           f"pad={args.width}:{args.height}:(ow-iw)/2:(oh-ih)/2,"
           f"split=2[l][r];[l][r]hstack=inputs=2")
+    if enc == "vaapi":
+        vf += ",format=nv12,hwupload"
+    else:
+        # x11grab delivers RGB (bgr0); without this, libx265 encodes RGB in the
+        # HEVC Range-Extensions profile, which the Quest's Main-profile c2.qti
+        # decoder ingests but cannot decode (DECODER_ACTIVE_NO_OUTPUT). Force
+        # 8-bit 4:2:0 → Main profile. (The mac avfoundation path captures nv12.)
+        vf += ",format=yuv420p"
+
+    dev_args = []
     if args.lavfi:
         src_args = ["-re", "-f", "lavfi", "-i", f"{args.lavfi}=rate={args.fps}"]
-    else:
+    elif IS_MAC:
         # The screen device rejects ffmpeg's default yuv420p — request one of
         # its native formats explicitly (nv12), or the input fails to open.
         src_args = ["-f", "avfoundation", "-capture_cursor", "1",
                     "-pixel_format", "nv12",
                     "-framerate", str(args.fps), "-i", f"{args.screen}:none"]
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", *src_args,
-           "-vf", vf,
-           "-c:v", "hevc_videotoolbox", "-realtime", "1",
-           "-b:v", args.bitrate, "-g", "1",                       # all-intra: gop 1
-           "-bsf:v", "hevc_metadata=aud=insert,dump_extra=freq=keyframe",
+    else:
+        # x11grab reads the whole display ($DISPLAY or --display, with an optional
+        # +x,y region). draw_mouse keeps the cursor visible like the mac path.
+        src_args = ["-f", "x11grab", "-draw_mouse", "1",
+                    "-framerate", str(args.fps), "-i", grab_display]
+
+    if enc == "videotoolbox":
+        enc_args = ["-c:v", "hevc_videotoolbox", "-realtime", "1"]
+        gop = "1"                                  # all-intra; videotoolbox signals Main
+    elif enc == "vaapi":
+        dev_args = ["-vaapi_device", args.vaapi_device]      # global init, before -i
+        enc_args = ["-c:v", "hevc_vaapi"]
+        gop = "1"
+    else:  # libx265 software
+        # The Quest's c2.qti HEVC decoder is Main-profile only. libx265 signals
+        # ALL-INTRA (gop=1) as the Range-Extensions profile, which that decoder
+        # ingests but never outputs (DECODER_ACTIVE_NO_OUTPUT), and ANY
+        # -x265-params re-triggers Rext too. So configure with native ffmpeg opts
+        # and a NORMAL GOP (periodic keyframes → Main profile). -bf 0 keeps
+        # latency low; over the lossless TCP/adb link periodic keyframes are fine.
+        enc_args = ["-c:v", "libx265", "-preset", "ultrafast", "-tune", "zerolatency",
+                    "-profile:v", "main", "-bf", "0"]
+        gop = str(max(1, int(args.fps)))           # keyframe ~every second
+
+    # AUD-delimit each access unit (the wire splitter keys on AUDs) and place the
+    # VPS/SPS/PPS at every keyframe (dump_extra reads the encoder extradata), so
+    # any keyframe is a clean decoder entry point.
+    bsf = "hevc_metadata=aud=insert,dump_extra=freq=keyframe"
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", *dev_args, *src_args,
+           "-vf", vf, *enc_args,
+           "-b:v", args.bitrate, "-g", gop,
+           "-bsf:v", bsf,
            "-f", "hevc", "-"]
     print("[headset-view] " + " ".join(cmd))
     # bufsize=0 → raw pipe: select() sees exactly what read() will return.
@@ -197,10 +275,15 @@ def main() -> int:
             ready, _, _ = select.select([proc.stdout], [], [], 1.0)
             if not ready:
                 if sent == 0 and time.monotonic() - t0 > 8.0:
-                    print("\n[headset-view] no frames after 8s — this is almost always the "
-                          "macOS Screen Recording permission.\nGrant it to your terminal app "
-                          "(System Settings → Privacy & Security → Screen & System Audio "
-                          "Recording),\nquit+reopen the terminal, and rerun.")
+                    if IS_MAC:
+                        print("\n[headset-view] no frames after 8s — almost always the macOS "
+                              "Screen Recording permission.\nGrant it to your terminal app "
+                              "(System Settings → Privacy & Security → Screen & System Audio "
+                              "Recording),\nquit+reopen the terminal, and rerun.")
+                    else:
+                        print("\n[headset-view] no frames after 8s — check x11grab can read the "
+                              f"display.\n$DISPLAY/--display = {grab_display!r}; x11grab needs X11 "
+                              "(not Wayland). Try `--display :0`.")
                     return 1
                 continue
             chunk = proc.stdout.read(65536)
