@@ -48,17 +48,52 @@ Then, at the lab: same calibration + app, now on the **real arms**.
 
 ## Part A — Control / sim stack on the Mac
 
-### Prereqs
-- Python **3.12** and [`uv`](https://docs.astral.sh/uv/) (`brew install uv`).
-- `adb` for the Quest: `brew install android-platform-tools`.
+### Dependencies — install these first
 
-### Set it up
+**System tools (Homebrew):**
+```sh
+brew install uv ffmpeg android-platform-tools
+```
+- **`uv`** — the **only** package manager this repo uses (**not conda, not pip
+  directly**). It creates the `.venv`, installs Python **3.12** itself if missing,
+  and resolves everything from the committed **`uv.lock`** (reproducible,
+  cross-platform — same versions on Mac and the lab Linux box).
+- **`ffmpeg`** — only for `scripts/headset_view.py` (streams the dashboard into
+  the Quest's video panel; on macOS it uses VideoToolbox natively). Recommended.
+- **`android-platform-tools`** — `adb`, for the Quest (pose ingest + installing
+  the APK).
+
+**Python environment (one command installs all Python deps):**
 ```sh
 git clone git@github.com:kairussenberger/Project-Castor.git
-cd Project-Castor
-git checkout hans-dev1
-uv sync --extra telemetry          # core + Rerun viewer
-uv run python scripts/verify_stack.py   # must pass (tests + probes + smokes)
+cd Project-Castor && git checkout hans-dev1
+uv sync --extra telemetry          # core runtime + Rerun 3D viewer
+```
+`uv sync` installs everything from `pyproject.toml` / `uv.lock`:
+- **core:** `numpy`, `pyzmq`, `msgpack`, `loop-rate-limiters`, `pyyaml`,
+  **`pin`** (Pinocchio) + **`pin-pink`** (the IK solver), **`daqp`** (QP solver),
+  `typing-extensions`
+- **`--extra telemetry`:** `rerun-sdk`, `fast-simplification` (the 3D viewer +
+  mesh decimation — recommended)
+- **`--extra vr`** *(optional)*: `vuer` — only if you use the browser/WebXR ingest
+  instead of the native ORBIT app (you won't, for normal use)
+- **dev group:** `pytest` (pulled in automatically by `uv run`)
+
+**⚠️ Pinocchio / conda — you do NOT need conda.** Pinocchio is the historic
+"conda-only" library, but here it ships as the **pip wheels `pin` / `pin-pink`**
+(cmeel), which have native **Apple-Silicon** wheels — `uv sync` just works on the
+M3, no conda. *Only* if those wheels ever fail would you fall back to
+`conda install -c conda-forge pinocchio` — and then keep the **entire** env in
+conda; never mix conda + uv. Default: **stick with uv.**
+
+**Not installed on the Mac:** the hardware drivers `i2rt` (YAM arms) and
+`orca_core` (hands) — Linux-only, only on the lab host. Sim needs neither.
+
+**Optional GIF renders:** `uv run --with matplotlib python scripts/render_session.py ...`
+
+### Verify it
+```sh
+uv run python scripts/verify_stack.py   # must pass: tests + probes + smokes
 ```
 
 ### See it move (no headset)
@@ -89,17 +124,30 @@ uv run python scripts/dashboard.py        # http://127.0.0.1:8180
 
 ## Part B — Quest app in Unity on the Mac
 
-### Setup
+### Dependencies — install these first
 ```sh
 git clone git@github.com:kairussenberger/castor-quest-app.git
-cd castor-quest-app
-git checkout feature/quest-calibration
+cd castor-quest-app && git checkout feature/quest-calibration
 ```
-- Install **Unity Hub** (unity.com/download) → sign in with a free **Unity
-  account** (Personal license — easy on the Mac GUI).
-- Install Unity Editor **`6000.3.9f1`** + **Android Build Support** (Android SDK &
-  NDK + OpenJDK modules). Native Apple Silicon.
-- Hub → Add → open `vr_quest_code/VR_Unity_Project`. (Skip the Linux fix script.)
+- **Unity Hub** — download from unity.com/download.
+- **Unity account** (free) — sign in once in Hub to get the **Personal** license
+  (easy on the Mac GUI; none of the headless activation pain).
+- **Unity Editor `6000.3.9f1`** — the **exact** version (the project pins it; Hub
+  offers it when you open the project). Native Apple Silicon.
+- **Android Build Support** module — and tick its **sub-modules**:
+  - **Android SDK & NDK Tools**
+  - **OpenJDK**
+- **`adb`** — bundled with the Android SDK Unity installs, or reuse
+  `android-platform-tools` from Part A.
+- Unity **packages auto-resolve** from `Packages/manifest.json` on first open
+  (OpenXR 1.16.1, XR Hands, XR Interaction Toolkit, XR Management, vendored
+  NetMQ) — nothing to install by hand.
+- For **passthrough** you'll add **one** package in the Editor's Package Manager:
+  **`com.unity.xr.meta-openxr`** (it pulls in **AR Foundation**) — steps in
+  `docs/castor-quest-changes.md`.
+
+Then: Hub → **Add** → open `vr_quest_code/VR_Unity_Project`. (Skip the Linux fix
+script — that's only for building on Linux.)
 
 ### Build → install → test loop
 1. File → Build Settings → **Android** → **Build** (produces `.apk`), or **Build
